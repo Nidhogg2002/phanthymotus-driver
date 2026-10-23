@@ -278,10 +278,39 @@ def test_loco_target_tool_schema_contract(monkeypatch):
     assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'}}
     assert tool['inputSchema']['x-completion'] == {'actions': ['move', 'rotate'], 'timeout': 120}
     assert set(tool['inputSchema']['x-action-params']) == {'move', 'rotate', 'stop_move', 'status'}
-    assert tool['inputSchema']['x-action-params']['move']['params'] == ['direction', 'distance_m']
+    assert tool['inputSchema']['x-action-params']['move']['params'] == [
+        'direction', 'distance_m', 'forward_m', 'left_m', 'turn_deg']
+    assert props['forward_m']['minimum'] == -3 and props['forward_m']['maximum'] == 3
+    assert props['left_m']['minimum'] == -3 and props['left_m']['maximum'] == 3
+    assert props['turn_deg']['minimum'] == -180 and props['turn_deg']['maximum'] == 180
     assert props['direction']['type'] == 'string'
     assert 'enum' not in props['direction']  # plain input, not another dropdown
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
+
+
+def test_2d_move_preflight_accepts_a_vector_and_turn(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    assert plugin._distance_preflight({'forward_m': 0.3, 'left_m': 0.4}) == (0.5, None)
+    assert plugin._distance_preflight({'forward_m': 0.0, 'left_m': 1.0}) == (1.0, None)
+    # turn_deg is validated and does not change the chorder distance
+    assert plugin._distance_preflight({'forward_m': 0.3, 'left_m': 0.4,
+                                       'turn_deg': 45}) == (0.5, None)
+
+
+@pytest.mark.parametrize('vector', [
+    {'forward_m': 0.0, 'left_m': 0.0},
+    {'forward_m': 0.01, 'left_m': 0.01},        # 0.014 m -> below 0.1
+    {'forward_m': 3.0, 'left_m': 1.0},          # 3.16 m
+    {'forward_m': 0.3, 'left_m': 0.4, 'turn_deg': 181},
+    {'forward_m': 'x', 'left_m': 0.4},
+])
+def test_2d_move_preflight_refuses_invalid_vectors(monkeypatch, vector):
+    module, _ = _load_device(monkeypatch)
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    result = plugin.dispatch('move', {'_tool_name': 'loco_target', **vector})
+    assert result['state'] == 'error'
+    assert 'action_id' not in result
 
 
 @pytest.mark.parametrize('distance', [None, 0, -1, 0.09, 3.01, float('nan'), True])

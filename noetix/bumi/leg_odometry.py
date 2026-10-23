@@ -97,6 +97,10 @@ def _matrix_multiply(a, b):
     return [[sum(a[i][k]*b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
 
 
+def _apply_transpose(rotation, vector):
+    return [sum(rotation[row][i]*vector[row] for row in range(3)) for i in range(3)]
+
+
 def _apply(rotation, vector):
     return [sum(rotation[i][j]*vector[j] for j in range(3)) for i in range(3)]
 
@@ -170,13 +174,19 @@ class LegOdometry:
     """Integrate body displacement from successive foot positions."""
 
     def __init__(self, slip_scale=None):
-        self.slip_scale = DISTANCE_SLIP_SCALE if slip_scale is None else float(slip_scale)
+        if slip_scale is None:
+            slip_scale = DISTANCE_SLIP_SCALE
+        if isinstance(slip_scale, (tuple, list)):
+            self.slip_scale = (float(slip_scale[0]), float(slip_scale[1]))
+        else:
+            self.slip_scale = float(slip_scale)
         if not math.isfinite(self.slip_scale) or self.slip_scale <= 0:
             raise ValueError('leg slip scale must be positive and finite')
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
         self.samples = 0
         self.stance_samples = 0
+        self.path_m = 0.0             # accumulated |step| since reset (arc progress)
         self.feet = None
         self.foot_gap = None          # fore-aft distance between the contacts
         self.double_support = False   # both feet moving with the body
@@ -200,6 +210,7 @@ class LegOdometry:
         """
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
+        self.path_m = 0.0
         self._feet = None
         self._rotation = None
         self._time = None
@@ -242,7 +253,8 @@ class LegOdometry:
                 end = _apply(rotation, current)
                 deltas.append([start[i]-end[i] for i in range(3)])
             lengths = [math.hypot(*delta) for delta in deltas]
-            limit = MAX_STEP_M/max(1.0, self.slip_scale)
+            scale_max = max(self.slip_scale) if isinstance(self.slip_scale, tuple) else self.slip_scale
+            limit = MAX_STEP_M/max(1.0, scale_max)
             plausible = [index for index in (0, 1) if lengths[index] <= limit]
             self.foot_gap = feet[0][0]-feet[1][0]
             self.double_support = (len(plausible) == 2
@@ -253,8 +265,15 @@ class LegOdometry:
                 else:
                     best = min(plausible, key=lambda index: lengths[index])
                     delta = deltas[best]
-                delta = [value*self.slip_scale for value in delta]
+                if isinstance(self.slip_scale, tuple):
+                    body_delta = _apply_transpose(rotation, delta)
+                    body_delta[0] *= self.slip_scale[0]
+                    body_delta[1] *= self.slip_scale[1]
+                    delta = _apply(rotation, body_delta)
+                else:
+                    delta = [value*self.slip_scale for value in delta]
                 self.position = [self.position[i]+delta[i] for i in range(3)]
+                self.path_m += math.hypot(*delta)
                 self.velocity = [value/dt for value in delta]
                 self.stance_samples += 1
             else:

@@ -535,12 +535,19 @@ class LocoPlugin:
                                   "description": "移动方向：前进、后退、左移、右移（也支持 forward/backward/left/right）；留空为前进。左右为保持机身朝向的侧移。"},
                     "distance_m": {"type": "number", "minimum": 0.1, "maximum": 3,
                                    "description": "沿指定起点机身方向移动的正数距离（米）；按腿式里程计估计，非经验证的实际距离。启动前保持静止。"},
+                    "forward_m": {"type": "number", "minimum": -3, "maximum": 3,
+                                  "description": "2D 移动的机身系前后分量（米，正=前）。与 left_m 一起给时按斜线移动，忽略 direction/distance_m。"},
+                    "left_m": {"type": "number", "minimum": -3, "maximum": 3,
+                               "description": "2D 移动的机身系左右分量（米，正=左）。与 forward_m 一起给时按斜线移动。"},
+                    "turn_deg": {"type": "number", "minimum": -180, "maximum": 180,
+                                 "description": "可选：边走边转时总共改变的角度（度，正=左转）。与 2D 分量一起给走弧线；单独给时按 distance_m 直线行走并转向。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["direction", "distance_m"], "description": "按腿式里程计估计沿指定方向移动；默认前进，左右为侧移。打滑系数在卡片配置里设置，对之后所有移动生效。数据异常时停车报错，精度待实测。"},
+                    "move": {"params": ["direction", "distance_m", "forward_m", "left_m", "turn_deg"],
+                             "description": "按腿式里程计估计移动：direction+distance_m 为四方向直线；forward_m+left_m 为斜线；再加 turn_deg 为边走边转的弧线。打滑系数在卡片配置里设置。数据异常时停车报错，精度待实测。"},
                     "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
                     "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
                     "status": {"params": [], "description": "查询当前目标动作、距离反馈来源及估计位移或转角结果。"},
@@ -906,6 +913,11 @@ class LocoPlugin:
                 return {"state": "running", "action_id": action_id,
                         "expected_duration_s": expected_duration_s,
                         ("requested_angle_deg" if action == "rotate" else "requested_distance_m"): value,
+                        **({"requested_forward_m": args.get('forward_m'),
+                            "requested_left_m": args.get('left_m'),
+                            "requested_turn_deg": args.get('turn_deg')}
+                           if action == "move" and (args.get('forward_m') is not None
+                                                    or args.get('left_m') is not None) else {}),
                         **({'feedback_source': 'leg_odometry_experimental',
                             'accuracy_validated': False} if action == 'move' else {})}
         except Exception as exc:
@@ -1009,6 +1021,25 @@ class LocoPlugin:
 
     def _distance_preflight(self, args):
         from imu_distance_control import movement_direction
+        if args.get('forward_m') is not None or args.get('left_m') is not None:
+            try:
+                forward = float(args.get('forward_m') or 0.0)
+                left = float(args.get('left_m') or 0.0)
+                turn = float(args.get('turn_deg') or 0.0)
+            except (TypeError, ValueError):
+                return None, {"state": "error",
+                              "error": "forward_m, left_m and turn_deg must be numbers"}
+            if (not all(math.isfinite(v) for v in (forward, left, turn))
+                    or not 0.1 <= math.hypot(forward, left) <= 3.0
+                    or abs(turn) > 180.0):
+                return None, {"state": "error",
+                              "error": "2D move: forward/left must give a 0.1-3 m vector and turn_deg within +-180"}
+            problem = self._rotate_mode_error()
+            if problem is not None:
+                return None, problem
+            from imu_distance_control import decode_imu
+            decode_imu(self._read_distance_imu())
+            return math.hypot(forward, left), None
         movement_direction(args.get('direction', ''))
         raw = args.get("distance_m")
         try:
@@ -1049,7 +1080,10 @@ class LocoPlugin:
         self._slip_scales.update(changes)
         return {"state": "configured", "slip_scales": dict(self._slip_scales)}
 
-    def _distance_slip_scale(self, args: dict) -> float:
+    def _distance_slip_scale(self, args: dict):
+        if args.get('forward_m') is not None or args.get('left_m') is not None:
+            lateral = 'left' if float(args.get('left_m') or 0.0) >= 0 else 'right'
+            return (self._slip_scales['forward'], self._slip_scales[lateral])
         from imu_distance_control import movement_direction
         direction, _, _ = movement_direction(args.get('direction', ''))
         return self._slip_scales[direction]
@@ -1062,9 +1096,16 @@ class LocoPlugin:
             if self._move_thread.is_alive():
                 return {"state": "error", "error": "previous move has not stopped"}
         self._set_servo_velocity_owner(True)
-        result = run_distance(self, float(args["distance_m"]), direction=args.get('direction', ''),
-                              full_scale=self._distance_full_scale(),
-                              slip_scale=self._distance_slip_scale(args))
+        if args.get('forward_m') is not None or args.get('left_m') is not None:
+            result = run_distance(self, forward_m=args.get('forward_m'),
+                                  left_m=args.get('left_m'),
+                                  turn_deg=args.get('turn_deg') or 0.0,
+                                  full_scale=self._distance_full_scale(),
+                                  slip_scale=self._distance_slip_scale(args))
+        else:
+            result = run_distance(self, float(args["distance_m"]), direction=args.get('direction', ''),
+                                  full_scale=self._distance_full_scale(),
+                                  slip_scale=self._distance_slip_scale(args))
         result['estimated_quality'] = 'experimental_unvalidated'
         return result
 

@@ -371,6 +371,78 @@ def _phase_leg(plant, parallel_after_m):
     return PhaseLeg
 
 
+def test_2d_path_moves_along_the_requested_bearing(monkeypatch):
+    clock = [0.0]
+    commands = []
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.vx = self.vy = 0.0
+        def _read_distance_imu(self):
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0, *, vy=0):
+            self.vx, self.vy = vx, vy
+            commands.append((vx, vy, vyaw))
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.path_m = 0.0
+            self.foot_gap = 0.0
+            self.double_support = True
+            self._last = None
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.path_m = 0.0
+            self._last = None
+        def reset_position(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+        def observe(self, joints, quaternion, now, frozen=False):
+            if frozen:
+                self.velocity = [0.0, 0.0, 0.0]
+                return
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            norm = math.hypot(owner.vx, owner.vy)
+            if norm == 0:
+                self.velocity = [0.0, 0.0, 0.0]
+                return
+            step = 0.16*dt
+            dx, dy = step*owner.vx/norm, step*owner.vy/norm
+            self.position = [self.position[0]+dx, self.position[1]+dy, 0.0]
+            self.path_m += step
+            self.velocity = [dx/dt, dy/dt, 0.0]
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_distance(owner, forward_m=0.3, left_m=0.2,
+                                 slip_scale=(1.0, 1.0))
+    assert result['state'] == 'done', result.get('error')
+    assert result['path_mode'] == 'line'
+    assert result['requested_forward_m'] == 0.3
+    assert result['requested_left_m'] == 0.2
+    assert result['leg_slip_scale'] == (1.0, 1.0)
+    assert result['final_position_error_m'] <= 0.15
+    assert any(vx and vy for vx, vy, _ in commands)
+
+
 def test_distance_waits_for_parallel_feet_before_braking(monkeypatch):
     plant = Plant(monkeypatch)
     monkeypatch.setattr(module, 'LegOdometry', _phase_leg(plant, 0.50))

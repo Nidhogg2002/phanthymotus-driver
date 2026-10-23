@@ -154,6 +154,17 @@ def travel_speed(command, direction, full_scale=None):
     return full_scale*(command-deadband)/(1.0-deadband)
 
 
+def command_for_speed(speed, direction, full_scale=None):
+    """Normalised command that produces `speed` on the calibrated curve."""
+    full_scale = travel_scale(direction, full_scale)
+    deadband = DEADBAND_NORMALISED[direction]
+    speed = abs(float(speed))
+    if speed <= 0:
+        return 0.0
+    fraction = min(1.0, speed/full_scale)
+    return deadband + (1.0-deadband)*fraction
+
+
 def lateral_limit(distance_m):
     """Path-deviation limit before a distance move is stopped.
 
@@ -210,14 +221,36 @@ def _write_trace(samples, commands, result):
         old.unlink()
 
 
-def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=None):
-    direction, body_x, body_y = movement_direction(direction)
+def run_distance(owner, distance_m=None, direction='', full_scale=None, slip_scale=None,
+                 forward_m=None, left_m=None, turn_deg=0.0):
+    path = None
+    path_mode = forward_m is not None or left_m is not None
+    if path_mode:
+        try:
+            path = {'forward': float(forward_m or 0.0), 'left': float(left_m or 0.0),
+                    'turn': math.radians(float(turn_deg or 0.0))}
+        except (TypeError, ValueError) as exc:
+            raise ValueError('forward_m, left_m and turn_deg must be numbers') from exc
+        if not all(math.isfinite(value) for value in path.values()):
+            raise ValueError('forward_m, left_m and turn_deg must be finite')
+        path['chord'] = math.hypot(path['forward'], path['left'])
+        if not 0.1 <= path['chord'] <= 3.0:
+            raise ValueError('the 2D move magnitude must be 0.1-3 m')
+        if abs(path['turn']) > math.pi:
+            raise ValueError('turn_deg must be within +-180 degrees')
+        path['bearing'] = math.atan2(path['left'], path['forward'])
+        path['arc'] = (abs(path['chord']/(2.0*math.sin(path['turn']/2.0))*path['turn'])
+                       if abs(path['turn']) > 1e-3 else path['chord'])
+        distance_m = path['arc']
+        direction, body_x, body_y = 'forward', 1, 0
+    else:
+        direction, body_x, body_y = movement_direction(direction)
     estimator = ImuOdometry()
     # The production LocoPlugin exposes the 21 SDK joint positions; those drive
     # the distance estimate. Owners without joint access (unit-test plants,
     # older bundles) keep the integrated-IMU path.
-    leg = (LegOdometry(slip_scale=(LEG_SLIP_SCALE[direction] if slip_scale is None
-                                   else float(slip_scale)))
+    leg_slip = LEG_SLIP_SCALE[direction] if slip_scale is None else slip_scale
+    leg = (LegOdometry(slip_scale=leg_slip)
            if hasattr(owner, '_read_distance_joints') else None)
     started = time.monotonic()
     motion_started = brake_started = quiet_since = None
@@ -230,6 +263,8 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
     last_joints = None
     joint_updates = 0
     last_command, last_command_at = 0.0, None
+    last_path_speed = 0.0
+    final_position_error = final_yaw_error = None
     finishing = False
     finish_started = None
     finish_phase = 'not_reached'
@@ -245,6 +280,11 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
     result = dict(state='error', requested_distance_m=distance_m, requested_direction=direction,
                   feedback_source='leg_odometry_experimental', accuracy_validated=False,
                   source_timestamp_available=False, stationary_assumed=False)
+    if path_mode:
+        result.update(requested_forward_m=path['forward'], requested_left_m=path['left'],
+                      requested_turn_deg=math.degrees(path['turn']),
+                      requested_arc_m=path['arc'], requested_distance_m=path['chord'],
+                      path_mode='arc' if abs(path['turn']) > 1e-3 else 'line')
     try:
         publish(0)
         while True:
@@ -295,7 +335,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
                     leg.reset_baseline()
                 origin_yaw = estimator.yaw
                 cy, sy = math.cos(origin_yaw), math.sin(origin_yaw)
-                c, s = cy*body_x-sy*body_y, sy*body_x+cy*body_y
+                c, s = (math.cos(origin_yaw+path['bearing']),
+                        math.sin(origin_yaw+path['bearing'])) if path_mode else (
+                    cy*body_x-sy*body_y, sy*body_x+cy*body_y)
                 result['start_yaw_deg'] = math.degrees(origin_yaw)
                 result['stationary_world_acceleration_mps2'] = estimator.baseline
                 print('[loco_target] IMU experimental calibration complete; distance is an estimate', flush=True)
@@ -304,17 +346,36 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
             if brake_started is None and now-changed_at > 0.5:
                 raise ValueError('IMU data unchanged during motion; source freshness cannot be verified')
             x, y, _ = source_position
-            moved = x*c+y*s
-            speed = source_velocity[0]*c+source_velocity[1]*s
-            yaw_error = angle_delta(origin_yaw, estimator.yaw)
-            lateral = abs(-x*s+y*c)
+            if path_mode:
+                if abs(path['turn']) > 1e-3:
+                    progress = getattr(leg, 'path_m', None)
+                    if progress is None or not math.isfinite(progress):
+                        progress = math.hypot(x, y)
+                    moved = progress
+                    lateral = 0.0
+                    target_yaw = origin_yaw+path['turn']*min(1.0, moved/max(path['arc'], 1e-6))
+                    speed = math.hypot(*source_velocity)
+                else:
+                    moved = x*c+y*s
+                    lateral = abs(-x*s+y*c)
+                    target_yaw = origin_yaw
+                    speed = source_velocity[0]*c+source_velocity[1]*s
+                yaw_error = angle_delta(target_yaw, estimator.yaw)
+            else:
+                moved = x*c+y*s
+                speed = source_velocity[0]*c+source_velocity[1]*s
+                yaw_error = angle_delta(origin_yaw, estimator.yaw)
+                lateral = abs(-x*s+y*c)
             if brake_started is None:
                 # Independent feed-forward travel estimate from the worker's
                 # own normalised commands through the measured command->speed
                 # curve. It cannot observe slip or the actual displacement, so
                 # it is a sanity bound only: a disagreement stops the move with
                 # an error instead of being used to finish it.
-                dead_reckoned_m += travel_speed(last_command, direction, full_scale)*(now-last_command_at)
+                if path_mode:
+                    dead_reckoned_m += last_path_speed*(now-last_command_at)
+                else:
+                    dead_reckoned_m += travel_speed(last_command, direction, full_scale)*(now-last_command_at)
                 last_command_at = now
                 samples[-1]['dead_reckoned_m'] = dead_reckoned_m
                 tolerance = travel_tolerance(distance_m)
@@ -367,18 +428,48 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
                     # corrections never reach the controller, so a pulse is sent
                     # whenever the error leaves the band and zero inside it.
                     error_deg = math.degrees(yaw_error)
-                    pulse = HEADING_PULSE_LATERAL if body_y else HEADING_PULSE
+                    if path_mode:
+                        pulse = (HEADING_PULSE_LATERAL
+                                 if abs(math.sin(path['bearing'])) > 0.5 else HEADING_PULSE)
+                    else:
+                        pulse = HEADING_PULSE_LATERAL if body_y else HEADING_PULSE
                     if error_deg < -HEADING_BAND_DEG:
                         turn = -pulse
                     elif error_deg > HEADING_BAND_DEG:
                         turn = pulse
                     else:
                         turn = 0.0
-                    # The lateral deadband is 0.60 normalised, so 0.9 is needed
-                    # to actually side-step; 0.65 barely moved.
-                    command = 0.9 if body_y else (0.6 if remaining > 0.2 else 0.5)
-                    publish(command*body_x, turn, vy=command*body_y)
-                    last_command, last_command_at = command, now
+                    if path_mode:
+                        command = 0.6 if remaining > 0.2 else 0.5
+                        if abs(path['turn']) > 1e-3:
+                            # Arc: the robot faces the tangent, so it only
+                            # walks forward; the heading schedule is closed by
+                            # the pulse law above.
+                            publish(command, turn, vy=0)
+                            last_path_speed = travel_speed(command, 'forward', full_scale)
+                        else:
+                            # Straight 2D: split the walking speed along the
+                            # requested bearing through the per-axis measured
+                            # command->speed curves (the lateral axis has its
+                            # own deadband).
+                            speed_mag = travel_speed(command, 'forward', full_scale)
+                            desired_f = speed_mag*math.cos(path['bearing'])
+                            desired_l = speed_mag*math.sin(path['bearing'])
+                            nx = command_for_speed(abs(desired_f), 'forward', full_scale)
+                            ny = command_for_speed(abs(desired_l), 'left', full_scale)
+                            norm = math.hypot(nx, ny)
+                            if norm > 1.0:
+                                nx, ny = nx/norm, ny/norm
+                            publish(math.copysign(nx, desired_f), turn,
+                                    vy=math.copysign(ny, desired_l))
+                            last_path_speed = math.hypot(desired_f, desired_l)
+                        last_command_at = now
+                    else:
+                        # The lateral deadband is 0.60 normalised, so 0.9 is
+                        # needed to actually side-step; 0.65 barely moved.
+                        command = 0.9 if body_y else (0.6 if remaining > 0.2 else 0.5)
+                        publish(command*body_x, turn, vy=command*body_y)
+                        last_command, last_command_at = command, now
             if brake_started is not None:
                 publish(0)
                 # A quiet accelerometer alone cannot distinguish rest from
@@ -397,7 +488,16 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
                     result['stationary_assumed'] = True
                     band = 0.10 if leg is not None else 0.05
                     result['endpoint_band_m'] = band
-                    if leg is not None:
+                    if path_mode:
+                        final_forward = x*cy+y*sy
+                        final_left = -x*sy+y*cy
+                        final_position_error = math.hypot(
+                            final_forward-path['forward'], final_left-path['left'])
+                        final_yaw_error = math.degrees(angle_delta(
+                            origin_yaw+path['turn'], estimator.yaw))
+                        if final_position_error > max(band, 0.15) or abs(final_yaw_error) > 2.0:
+                            raise ValueError('stopped outside the estimated 2D target')
+                    elif leg is not None:
                         if remaining > band or remaining < -PARALLEL_FINISH_ALLOWANCE_M:
                             raise ValueError('stopped outside the estimated target band')
                     elif abs(remaining) > band:
@@ -423,6 +523,8 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
                   finish_phase=finish_phase,
                   finish_overshoot_m=finish_overshoot,
                   final_foot_gap_m=(getattr(leg, 'foot_gap', None) if leg is not None else None),
+                  final_position_error_m=final_position_error,
+                  final_yaw_error_deg=final_yaw_error,
                   elapsed_s=time.monotonic()-started)
     try:
         _write_trace(samples, commands, result)
