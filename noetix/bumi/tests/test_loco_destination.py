@@ -298,6 +298,38 @@ def test_2d_move_preflight_accepts_a_vector_and_turn(monkeypatch):
                                        'turn_deg': 45}) == (0.5, None)
 
 
+def test_cardinal_turn_is_forwarded_as_a_2d_arc(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    import imu_distance_control
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    calls = []
+    def fake(*args, **kwargs):
+        calls.append(kwargs)
+        return {'state': 'done'}
+    monkeypatch.setattr(imu_distance_control, 'run_distance', fake)
+    result = plugin._do_distance_impl({'distance_m': 1.0, 'direction': 'forward',
+                                       'turn_deg': 90})
+    assert result['state'] == 'done'
+    assert calls[0]['forward_m'] == 1.0
+    assert calls[0]['left_m'] == 0.0
+    assert calls[0]['turn_deg'] == 90.0
+
+
+def test_2d_move_preflight_bounds_the_arc_not_only_the_chord(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    # 3 m chord + 180 deg -> 4.7 m arc: refused.
+    result = plugin.dispatch('move', {'_tool_name': 'loco_target', 'forward_m': 3.0,
+                                      'left_m': 0.0, 'turn_deg': 180})
+    assert result['state'] == 'error'
+    assert 'path length' in result['error']
+    # Same for the direction+distance form.
+    result = plugin.dispatch('move', {'_tool_name': 'loco_target', 'distance_m': 3.0,
+                                      'direction': 'forward', 'turn_deg': 180})
+    assert result['state'] == 'error'
+    assert '3 m' in result['error']
+
+
 @pytest.mark.parametrize('vector', [
     {'forward_m': 0.0, 'left_m': 0.0},
     {'forward_m': 0.01, 'left_m': 0.01},        # 0.014 m -> below 0.1

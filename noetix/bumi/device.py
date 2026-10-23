@@ -540,7 +540,7 @@ class LocoPlugin:
                     "left_m": {"type": "number", "minimum": -3, "maximum": 3,
                                "description": "2D 移动的机身系左右分量（米，正=左）。与 forward_m 一起给时按斜线移动。"},
                     "turn_deg": {"type": "number", "minimum": -180, "maximum": 180,
-                                 "description": "可选：边走边转时总共改变的角度（度，正=左转）。与 2D 分量一起给走弧线；单独给时按 distance_m 直线行走并转向。"},
+                                 "description": "可选：边走边转时总共改变的角度（度，正=左转）。可与 forward_m/left_m 或 direction+distance_m 一起给；生成的路径（弧长）也必须 ≤3 m。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
                 },
@@ -1034,6 +1034,12 @@ class LocoPlugin:
                     or abs(turn) > 180.0):
                 return None, {"state": "error",
                               "error": "2D move: forward/left must give a 0.1-3 m vector and turn_deg within +-180"}
+            chord = math.hypot(forward, left)
+            arc = (abs(chord/(2.0*math.sin(math.radians(turn)/2.0))*math.radians(turn))
+                   if abs(turn) > 1e-3 else chord)
+            if not 0.1 <= arc <= 3.0:
+                return None, {"state": "error",
+                              "error": "2D move: the path length (chord + turn) must be 0.1-3 m"}
             problem = self._rotate_mode_error()
             if problem is not None:
                 return None, problem
@@ -1048,6 +1054,17 @@ class LocoPlugin:
             distance = float("nan")
         if isinstance(raw, bool) or not math.isfinite(distance) or not 0.1 <= distance <= 3.0:
             return None, {"state": "error", "error": "distance_m must be a finite number from 0.1 to 3 metres"}
+        try:
+            turn = float(args.get('turn_deg') or 0.0)
+        except (TypeError, ValueError):
+            return None, {"state": "error", "error": "turn_deg must be a number"}
+        if not math.isfinite(turn) or abs(turn) > 180.0:
+            return None, {"state": "error", "error": "turn_deg must be a finite angle within +-180"}
+        arc = (abs(distance/(2.0*math.sin(math.radians(turn)/2.0))*math.radians(turn))
+               if abs(turn) > 1e-3 else distance)
+        if not 0.1 <= arc <= 3.0:
+            return None, {"state": "error",
+                          "error": "distance_m plus turn_deg gives a path longer than 3 m; reduce the distance or the turn"}
         problem = self._rotate_mode_error()
         if problem is not None:
             return None, problem
@@ -1096,12 +1113,26 @@ class LocoPlugin:
             if self._move_thread.is_alive():
                 return {"state": "error", "error": "previous move has not stopped"}
         self._set_servo_velocity_owner(True)
+        try:
+            turn = float(args.get('turn_deg') or 0.0)
+        except (TypeError, ValueError):
+            turn = 0.0
         if args.get('forward_m') is not None or args.get('left_m') is not None:
             result = run_distance(self, forward_m=args.get('forward_m'),
                                   left_m=args.get('left_m'),
-                                  turn_deg=args.get('turn_deg') or 0.0,
+                                  turn_deg=turn,
                                   full_scale=self._distance_full_scale(),
                                   slip_scale=self._distance_slip_scale(args))
+        elif abs(turn) > 1e-3:
+            from imu_distance_control import movement_direction
+            _, body_x, body_y = movement_direction(args.get('direction', ''))
+            distance = float(args['distance_m'])
+            lateral = 'left' if body_y >= 0 else 'right'
+            result = run_distance(self, forward_m=distance*body_x,
+                                  left_m=distance*body_y, turn_deg=turn,
+                                  full_scale=self._distance_full_scale(),
+                                  slip_scale=(self._slip_scales['forward'],
+                                              self._slip_scales[lateral]))
         else:
             result = run_distance(self, float(args["distance_m"]), direction=args.get('direction', ''),
                                   full_scale=self._distance_full_scale(),

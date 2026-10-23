@@ -443,6 +443,19 @@ def test_2d_path_moves_along_the_requested_bearing(monkeypatch):
     assert any(vx and vy for vx, vy, _ in commands)
 
 
+def test_arc_length_is_bounded_to_three_metres(monkeypatch):
+    plant = Plant(monkeypatch)
+    with pytest.raises(ValueError, match='path length'):
+        module.run_distance(plant, forward_m=3.0, left_m=0.0, turn_deg=180)
+
+
+def test_arc_issues_nonzero_turn_commands(monkeypatch):
+    plant = Plant(monkeypatch)
+    result = module.run_distance(plant, forward_m=1.0, left_m=0.0, turn_deg=90)
+    assert result['path_mode'] == 'arc'
+    assert any(vyaw for _, _, vyaw in plant.commands)
+
+
 def test_distance_waits_for_parallel_feet_before_braking(monkeypatch):
     plant = Plant(monkeypatch)
     monkeypatch.setattr(module, 'LegOdometry', _phase_leg(plant, 0.50))

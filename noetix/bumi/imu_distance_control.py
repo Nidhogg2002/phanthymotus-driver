@@ -241,6 +241,8 @@ def run_distance(owner, distance_m=None, direction='', full_scale=None, slip_sca
         path['bearing'] = math.atan2(path['left'], path['forward'])
         path['arc'] = (abs(path['chord']/(2.0*math.sin(path['turn']/2.0))*path['turn'])
                        if abs(path['turn']) > 1e-3 else path['chord'])
+        if not 0.1 <= path['arc'] <= 3.0:
+            raise ValueError('the path length (chord + turn) must be 0.1-3 m')
         distance_m = path['arc']
         direction, body_x, body_y = 'forward', 1, 0
     else:
