@@ -42,7 +42,8 @@
 - `run_distance` 在 owner 暴露 `_read_distance_joints()` 时使用腿式里程计（生产的
   `LocoPlugin` 总是暴露），否则退回原 IMU 积分（单元测试用的 plant、旧 bundle）。
   结果新增 `distance_source`、`imu_position_m`、`imu_velocity_mps`；`feedback_source`
-  仍保留实验入口标识 `imu_integrated_experimental`。
+  当时仍保留实验入口标识 `imu_integrated_experimental`；当前实现已改为
+  `leg_odometry_experimental`（历史记录保留原标识，便于对照旧镜像结果）。
 - 保留：SDK 四元数用于姿态和偏航/倾角检查；加速度/四元数/新鲜度/反向/超走/横向/
   速度/超时保护；加速度合理性上限 50 m/s²；指令积分只作交叉校验故障界限。
 - 真机首测（2026-10-21 18:50，请求 0.5 m）：终态 done、`distance_source=leg_odometry`、

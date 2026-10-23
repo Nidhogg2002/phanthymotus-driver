@@ -57,6 +57,24 @@ def test_reset_position_keeps_the_previous_foot_for_the_next_step():
     assert estimator.position == pytest.approx([0.005, 0.0, 0.0], abs=1e-9)
 
 
+def test_per_axis_slip_scales_the_body_axes_independently():
+    estimator = module.LegOdometry(slip_scale=(2.0, 4.0))
+    feet = stand_feet()
+    estimator.observe_feet(feet, IDENTITY, 0.0)
+    # Feet forward 2 mm and left 2 mm -> body step (+2 mm, -2 mm); x*2, y*4.
+    estimator.observe_feet([[f[0]-0.002, f[1]+0.002, f[2]] for f in feet],
+                           IDENTITY, 0.02)
+    assert estimator.slip_scale == (2.0, 4.0)
+    assert estimator.position[0] == pytest.approx(0.004, abs=1e-6)
+    assert estimator.position[1] == pytest.approx(-0.008, abs=1e-6)
+
+
+@pytest.mark.parametrize('bad', [(1.0,), (0.0, 2.0), (2.0, -1.0), (2.0, float('nan')), 'x'])
+def test_invalid_per_axis_slip_is_rejected(bad):
+    with pytest.raises((ValueError, TypeError)):
+        module.LegOdometry(slip_scale=bad)
+
+
 def test_reset_baseline_drops_the_calibration_sample():
     """Calibration feet must not become the first motion sample's baseline."""
     estimator = module.LegOdometry(slip_scale=1.0)

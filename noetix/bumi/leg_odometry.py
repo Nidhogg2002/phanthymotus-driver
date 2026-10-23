@@ -177,11 +177,17 @@ class LegOdometry:
         if slip_scale is None:
             slip_scale = DISTANCE_SLIP_SCALE
         if isinstance(slip_scale, (tuple, list)):
-            self.slip_scale = (float(slip_scale[0]), float(slip_scale[1]))
+            if len(slip_scale) != 2:
+                raise ValueError('leg slip scale must be a number or a (forward, lateral) pair')
+            scales = (float(slip_scale[0]), float(slip_scale[1]))
+            if not all(math.isfinite(value) and value > 0 for value in scales):
+                raise ValueError('leg slip scales must be positive and finite')
+            self.slip_scale = scales
         else:
-            self.slip_scale = float(slip_scale)
-        if not math.isfinite(self.slip_scale) or self.slip_scale <= 0:
-            raise ValueError('leg slip scale must be positive and finite')
+            value = float(slip_scale)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError('leg slip scale must be positive and finite')
+            self.slip_scale = value
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
         self.samples = 0
