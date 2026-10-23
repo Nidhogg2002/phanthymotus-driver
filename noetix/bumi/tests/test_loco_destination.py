@@ -298,6 +298,21 @@ def test_2d_move_preflight_accepts_a_vector_and_turn(monkeypatch):
                                        'turn_deg': 45}) == (0.5, None)
 
 
+def test_2d_slip_uses_the_backward_factor_for_negative_forward(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    scales = plugin._slip_scales
+    assert plugin._distance_slip_scale({'forward_m': -1.0, 'left_m': 0.2}) == (
+        scales['backward'], scales['left'])
+    assert plugin._distance_slip_scale({'forward_m': -0.5, 'left_m': -0.2}) == (
+        scales['backward'], scales['right'])
+    assert plugin._distance_slip_scale({'forward_m': 1.0, 'left_m': 0.2}) == (
+        scales['forward'], scales['left'])
+    # Pure lateral: the longitudinal factor is unused; forward is the default.
+    assert plugin._distance_slip_scale({'forward_m': 0.0, 'left_m': 0.5}) == (
+        scales['forward'], scales['left'])
+
+
 def test_cardinal_turn_is_forwarded_as_a_2d_arc(monkeypatch):
     module, _ = _load_device(monkeypatch)
     import imu_distance_control

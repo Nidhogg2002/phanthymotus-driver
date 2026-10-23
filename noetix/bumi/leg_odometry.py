@@ -150,17 +150,15 @@ def foot_geometry(angles, chain):
             [position[i]+toe[i] for i in range(3)])
 
 
-def contact_point(heel, toe, body_rotation=None):
-    """Continuous contact between the heel and toe of one foot.
+def contact_point(heel, toe):
+    """Fixed sole-centre contact between the heel and toe of one foot.
 
-    The blend weight uses the height of each point in the body frame (or in the
-    world frame when `body_rotation` is supplied): the lower point wins, with a
-    smooth transition over `CONTACT_BLEND_M`, so a rolling foot slides the
-    contact instead of jumping between corners.
+    A height-weighted rolling blend was tried and rejected: on this gait the
+    contact point slides with the foot roll and cancels the body step (0.18 m
+    estimated against 0.44 m with the fixed centre over the same run). The
+    fixed centre keeps the estimate continuous; slip is corrected globally by
+    the per-direction slip scale instead.
     """
-    # The rolling blend was measured to *reduce* the estimate on this gait (the
-    # contact slides with the roll and cancels the body step: 0.18 m vs 0.44 m
-    # over the same run). Keep the fixed sole centre and correct slip globally.
     return [(heel[i]+toe[i])/2 for i in range(3)]
 
 

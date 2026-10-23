@@ -1099,8 +1099,14 @@ class LocoPlugin:
 
     def _distance_slip_scale(self, args: dict):
         if args.get('forward_m') is not None or args.get('left_m') is not None:
-            lateral = 'left' if float(args.get('left_m') or 0.0) >= 0 else 'right'
-            return (self._slip_scales['forward'], self._slip_scales[lateral])
+            forward = float(args.get('forward_m') or 0.0)
+            left = float(args.get('left_m') or 0.0)
+            # A negative forward component is a backward move: use its own
+            # measured factor. forward == 0 is a pure lateral move, where the
+            # longitudinal factor is unused; forward is the documented default.
+            longitudinal = 'backward' if forward < 0 else 'forward'
+            lateral = 'left' if left >= 0 else 'right'
+            return (self._slip_scales[longitudinal], self._slip_scales[lateral])
         from imu_distance_control import movement_direction
         direction, _, _ = movement_direction(args.get('direction', ''))
         return self._slip_scales[direction]

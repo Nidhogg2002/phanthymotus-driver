@@ -198,7 +198,10 @@ PARALLEL_FINISH_TIMEOUT_S = 0.4
 # The finish walks at the walking speed (~0.35 m/s); a 0.5 s window would add
 # ~0.17 m, so the window and the allowed extra must stay consistent or the
 # overshoot guard would fire during the finish itself.
-PARALLEL_FINISH_ALLOWANCE_M = 0.15
+# The finish requests an extra 0.05 m (PARALLEL_FINISH_MAX_EXTRA_M); the
+# accepted endpoint bound is the documented 0.10 m experimental band, exposed
+# as endpoint_band_m. The guard and the endpoint must agree with that band.
+PARALLEL_FINISH_ALLOWANCE_M = 0.10
 # The finish may walk past the target only this far; the gait phase arrives
 # once per step, so waiting for it can cost ~0.1-0.15 m. Distance accuracy wins
 # over feet alignment beyond this cap.
