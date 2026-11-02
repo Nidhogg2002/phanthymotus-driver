@@ -64,6 +64,9 @@ plugins:
     # RSUSB SDK is required. Set imu_assisted: false for visual-only mode.
     imu_assisted: true
     imu_source: controller
+    # Bumi walks on a flat floor: constrain RTAB-Map to x/y/yaw so z cannot
+    # drift from depth-registration noise. Disable only for ramps/stairs.
+    planar_2d: true
     # Raw branch sample rate when enabled. The measured raw cadence is ~8.3 Hz
     # at this cap and RTAB-Map currently processes ~7.5-9 Hz, so 10 Hz bounds
     # the extra DDS/CPU load instead of duplicating every 30 Hz camera frame.
