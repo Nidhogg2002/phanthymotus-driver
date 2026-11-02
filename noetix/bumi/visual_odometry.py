@@ -88,7 +88,7 @@ def parameter_file(config):
     return '\n'.join(lines)+'\n'
 
 
-def parameters(segment, frame_id, imu_assisted=False, planar=False):
+def parameters(segment, frame_id, imu_assisted=False):
     """Parameters for the bundle-local visual estimator.
 
     ``frame_id`` is the segment's base frame, which coincides with the optical
@@ -101,10 +101,6 @@ def parameters(segment, frame_id, imu_assisted=False, planar=False):
                 **{'Odom/ResetCountdown': '0'})
     if imu_assisted:
         config['Odom/GuessSmoothingDelay'] = '0'  # orientation only, no acceleration prediction
-    if planar:
-        # Bumi walks on a flat floor. Constrain the estimator to x/y/yaw so
-        # depth-registration noise cannot invent vertical motion or roll/pitch.
-        config['Odom/Force3DoF'] = 'true'
     return config
 
 
@@ -136,14 +132,13 @@ class ChildProcesses:
         self.prefix = prefix
         self.children = []
 
-    def start(self, segment, frame_id, imu_topic=None, *, planar=False):
+    def start(self, segment, frame_id, imu_topic=None):
         if self.children:
             raise RuntimeError('old visual odometry process still present')
         if self.prefix is None:
             from ament_index_python.packages import get_package_prefix
             self.prefix = get_package_prefix
-        config = parameters(segment, frame_id, imu_assisted=bool(imu_topic),
-                            planar=planar)
+        config = parameters(segment, frame_id, imu_assisted=bool(imu_topic))
         root = '/'+segment
         path = self.directory/'odometry.yaml'
         try:
@@ -243,7 +238,6 @@ class VisualOdometryNode:
         if self.imu_assisted and requested_source == 'controller' and high_ctrl is None:
             requested_source = 'state'
         self.imu_source = requested_source
-        self.planar = self.config.get('planar_2d', False) is True
         self.imu_reader = None
         self.imu_reader_stop = None
         self.imu_reader_signature = None
@@ -648,10 +642,9 @@ class VisualOdometryNode:
         self._subscribe(OdomInfo, root+'/diagnostic', self.diagnostic, self.result_subs)
         if self.imu_assisted:
             self.children.start(self.segment, self.base_frame(),
-                                imu_topic=root+'/imu', planar=self.planar)
+                                imu_topic=root+'/imu')
         else:
-            self.children.start(self.segment, self.base_frame(),
-                                planar=self.planar)
+            self.children.start(self.segment, self.base_frame())
 
     def _start_controller_imu(self):
         if self.high_ctrl is None:

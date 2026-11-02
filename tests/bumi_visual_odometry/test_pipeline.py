@@ -6,12 +6,6 @@ import pytest
 from noetix.bumi.visual_odometry import ChildProcesses, parameter_file, parameters
 
 
-def test_planar_mode_forces_three_dof_odometry():
-    visual = parameters('seg', 'robot_rgb_optical', planar=True)
-    assert visual['Odom/Force3DoF'] == 'true'
-    assert 'Odom/Force3DoF' not in parameters('seg', 'robot_rgb_optical')
-
-
 def test_parameters_are_visual_only():
     visual = parameters('seg', 'robot_rgb_optical')
     assert visual['frame_id'] == 'robot_rgb_optical'
