@@ -189,11 +189,11 @@ rejected. `ControlSink` checks the schema, TTL, observation age, sequence and
 source priority. Rejected/stale messages never feed the watchdog.
 
 The control descriptor declares a conservative navigation-posture footprint as
-`half_width: 0.3` m (`0.60` m overall, source `estimate`), enlarged from the
+`half_width: 0.39` m (`0.78` m overall envelope, source `estimate`), enlarged from the
 measured `0.55` m width. Navi owns the
 separate dynamic clearance margin; with its default 0.15 m on each side the
-displayed avoidance corridor is therefore 0.90 m wide, rather than the 1.00 m
-conservative fallback used when a chassis declares no footprint.
+displayed avoidance corridor is therefore 1.08 m wide. The fallback used when
+a chassis declares no footprint is 1.00 m wide.
 
 The domain-42 input uses the existing socket subscription bridge. Output now
 uses the official Slamware C++ SDK, **not ROS `/cmd_vel`**: the Tianyi hardware
