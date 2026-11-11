@@ -47,8 +47,8 @@ public:
     void refresh_heartbeat() { platform_.refreshHeartBeat(token_); }
     void stop_heartbeat() { platform_.stopHeartBeat(token_); }
     void begin() {
-        // Preserve the official default localization-quality monitor.
-        action_ = platform_.velocityControl();
+        // Visual following must also work outside a prebuilt chassis map.
+        action_ = platform_.velocityControl(rpos::features::motion_planner::NotMonitored);
         if (!action_) throw std::runtime_error("SDK returned an empty velocity action");
     }
     void verify_owned() {

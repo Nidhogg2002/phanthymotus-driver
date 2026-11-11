@@ -24,6 +24,7 @@ struct Handle {
 };
 Handle owned, current;
 int current_reads = 0, begin_calls = 0, selected_flag = -1;
+bool low_localization_quality = false;
 }
 
 namespace rpos {
@@ -80,6 +81,11 @@ public:
             features::motion_planner::MonitoredByLocalizationQuality) {
         ++fake::begin_calls;
         fake::selected_flag = flag;
+        if (fake::low_localization_quality &&
+            flag == features::motion_planner::MonitoredByLocalizationQuality) {
+            fake::owned.status = fake::current.status = core::ActionStatusError;
+            fake::owned.reason = fake::current.reason = "Low localization quality";
+        }
         return actions::VelocityControlMoveAction(&fake::owned);
     }
     features::system_resource::HeartBeatToken startHeartBeat(int) { return {}; }
@@ -96,6 +102,7 @@ HARNESS = r'''
 
 int main(int argc, char** argv) {
     std::string mode = argv[1];
+    if (mode == "low_localization_quality") fake::low_localization_quality = true;
     if (mode == "current_empty") fake::current.id = 0;
     if (mode == "mismatch" || mode == "diagnostics_fail") {
         fake::current.id = 27;
@@ -165,11 +172,11 @@ def run_adapter(binary, mode):
     return dict(line.split("=", 1) for line in result.stdout.splitlines())
 
 
-@pytest.mark.parametrize("mode", ["running", "waiting"])
-def test_accepted_action_preserves_successful_sdk_calls(adapter_binary, mode):
+@pytest.mark.parametrize("mode", ["running", "waiting", "low_localization_quality"])
+def test_map_independent_velocity_preserves_successful_sdk_calls(adapter_binary, mode):
     result = run_adapter(adapter_binary, mode)
     assert result["message"] == "ok"
-    assert result["selected_flag"] == "0"  # Default localization monitor remains.
+    assert result["selected_flag"] == "1"  # NotMonitored for map-independent following.
     assert result["current_reads"] == result["begin_calls"] == "1"
     assert result["owned_ids"] == result["current_ids"] == "1"
     assert result["current_statuses"] == "1"

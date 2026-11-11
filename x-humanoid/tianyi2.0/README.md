@@ -202,10 +202,13 @@ Discrete REST direction actions cannot preserve arbitrary simultaneous vx/wz.
 
 A private `tianyi-loco-sdk` worker connects to `sdk_host:sdk_port` (defaults
 `192.168.11.1:1445`, distinct from HTTP port 1448). It calls
-`SlamwareCorePlatform::velocityControl()` with the official localization-quality
-monitor enabled, then `VelocityControlMoveAction::setVelocity(vx, 0, wz)`.
-It does not use `NotMonitored` or change global speed/brake/emergency-stop
-parameters. `native/build_sdk.sh` pins the official ROS2 SDK 5.1.1 GCC11 package
+`SlamwareCorePlatform::velocityControl(NotMonitored)` so visual following can
+operate outside a prebuilt chassis map, then
+`VelocityControlMoveAction::setVelocity(vx, 0, wz)`. This velocity action does not
+stop solely because map-localization quality is low. It does not change global
+speed/brake/emergency-stop parameters; command freshness, watchdog, velocity
+limits, ownership checks and fatal SDK-error handling remain enforced.
+`native/build_sdk.sh` pins the official ROS2 SDK 5.1.1 GCC11 package
 and SHA256 for ARM64 and AMD64; it compiles only this private C++ worker, not
 the vendor ROS server. Third-party license notices are installed in
 `/usr/share/doc/tianyi-loco-sdk/`.
@@ -229,8 +232,8 @@ in dry-run. Starting an already paused/yielded session does not resume it.
 **New cards default to dry-run.** Dry-run does not launch/connect the SDK worker or
 create a chassis action. Turning dry-run off while running first requires a
 successful read-only SDK connection. Connection alone creates no motion action.
-An incompatible SDK/firmware, a disconnected SDK endpoint, or low localization
-quality is reported as an error; no direction-action fallback is attempted.
+An incompatible SDK/firmware, a disconnected SDK endpoint, or a failed SDK action
+is reported as an error; no direction-action fallback is attempted.
 The endpoint and actual firmware velocity/heartbeat behavior still require
 hardware validation with the new image.
 
@@ -531,8 +534,9 @@ not establish that another controller took over; inspect the recorded details.
 2. In a controlled hardware test, turning dry-run off must report
    `backend.type = slamware_sdk`, `connected = true`, and no backend error.
    Check odometry against small vx-only, wz-only and combined commands.
-3. Test zero, pause, stop, input loss, worker loss, low localization quality,
-   and transfer to/from nav/home before using unattended navigation. Read the
+3. Test zero, pause, stop, input loss, worker loss, and transfer to/from nav/home
+   before using unattended navigation. In an unmapped area, verify that low
+   localization quality alone does not terminate visual following. Read the
    actual stop result, not just the UI button state.
 
 Official references: [platform and heartbeat API](https://developer.slamtec.com/docs/slamware/cpp-sdk-en/4.6.2_rtm/slamware_core_platform/),
