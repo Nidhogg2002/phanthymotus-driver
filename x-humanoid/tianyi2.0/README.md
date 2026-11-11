@@ -188,10 +188,11 @@ ratings. Non-finite values, unsupported axes and out-of-range commands are
 rejected. `ControlSink` checks the schema, TTL, observation age, sequence and
 source priority. Rejected/stale messages never feed the watchdog.
 
-The control descriptor declares the measured navigation-posture footprint as
-`half_width: 0.275` m (`0.55` m overall, source `measured`). Navi owns the
+The control descriptor declares a conservative navigation-posture footprint as
+`half_width: 0.3` m (`0.60` m overall, source `estimate`), enlarged from the
+measured `0.55` m width. Navi owns the
 separate dynamic clearance margin; with its default 0.15 m on each side the
-displayed avoidance corridor is therefore 0.85 m wide, rather than the 1.00 m
+displayed avoidance corridor is therefore 0.90 m wide, rather than the 1.00 m
 conservative fallback used when a chassis declares no footprint.
 
 The domain-42 input uses the existing socket subscription bridge. Output now
