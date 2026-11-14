@@ -474,7 +474,10 @@ class FrontDepthPlugin:
                 nested = args.get("config", {})
                 if not isinstance(nested, dict):
                     raise ValueError("config must be an object")
-                values = {**nested, **{k: v for k, v in args.items() if k not in {"config", "_tool_name"}}}
+                # Core attaches instance_id to canvas configuration calls;
+                # this single-instance card must not persist it as a setting.
+                values = {**nested, **{k: v for k, v in args.items()
+                                      if k not in {"config", "_tool_name", "instance_id"}}}
                 self._configure(values)
                 return {**self._info(), "state": "configured", "restart_required": True}
             elif action not in ("info", NAME):

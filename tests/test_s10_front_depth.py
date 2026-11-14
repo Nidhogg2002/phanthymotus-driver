@@ -184,6 +184,21 @@ def test_persist_failure_does_not_apply_new_config(rig, monkeypatch):
     assert not rig.destroyed
 
 
+def test_canvas_instance_transport_does_not_become_a_depth_setting(rig):
+    from common.vendor_runtime import DriverBundle
+    bundle = DriverBundle([rig.plugin])
+    result = bundle.dispatch("camera_front__depth", {
+        "action": "config", "instance_id": "canvas-depth-1",
+        "cloud_topic": "/raw/front", "cloud_frame_id": "front_lidar",
+        "camera_optical_from_cloud": json.dumps(IDENTITY),
+    })
+    assert result["state"] == "configured", result
+    assert "instance_id" not in result["config"]
+    assert "instance_id" not in json.loads(rig.path.read_text())["config"]
+    assert bundle.dispatch("camera_front__depth", {
+        "action": "start", "instance_id": "canvas-depth-1"})["state"] == "running"
+
+
 def test_start_is_lazy_and_idempotent_preserves_source_stamp_and_metric_payload(rig):
     configure(rig)
     rig.plugin.start()  # Bundle startup only advertises the card.
