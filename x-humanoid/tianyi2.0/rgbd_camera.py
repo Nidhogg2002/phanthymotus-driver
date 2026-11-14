@@ -18,6 +18,7 @@ import zlib
 import numpy as np
 
 from common.camera_mount import BodyMountSource
+from common.capture_clock import host_clock_reference
 
 
 def make_geometry(color, depth, *, registered):
@@ -318,6 +319,14 @@ class RgbdCameraPlugin:
     def _declarations(self):
         declarations = camera_declarations(self.root, self.geometry, self.clock,
             color_topic=self.color_topic, depth_topic=self.depth_topic) if self.geometry is not None else []
+        if self.registered:
+            # The verified global source mode maps exposure timestamps to the
+            # host realtime clock; retain the original headers and source ID.
+            # No SDK mapping uncertainty bound is asserted here.
+            reference = host_clock_reference()
+            if reference is not None:
+                for entry in declarations:
+                    entry['vendor']['clock_reference'] = deepcopy(reference)
         if getattr(self, 'body_mount', None) is not None:
             for entry in declarations:
                 entry['vendor']['body_mount'] = self.body_mount.declaration()

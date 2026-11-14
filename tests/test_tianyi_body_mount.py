@@ -245,3 +245,14 @@ def test_mount_matches_each_published_capture(source, streams, offset):
     actual = [(topic, json.loads(msg.data)['stamp_ns'] if topic.endswith('/body_mount')
                else m._stamp(msg)) for topic, msg in source.events]
     assert actual == expected
+
+
+def test_clock_reference_only_declared_after_global_source_confirmation(source, monkeypatch):
+    reference = dict(clock_id='host_realtime', domain_id='actual-boot', timestamp_basis='host_realtime')
+    monkeypatch.setattr(m, 'host_clock_reference', lambda: deepcopy(reference))
+    source.registered = True
+    values = source._declarations()
+    assert values[0]['vendor']['clock_reference'] == reference
+    assert values[0]['vendor']['clock_id'] == source.clock
+    source.registered = False
+    assert 'clock_reference' not in source._declarations()[0]['vendor']

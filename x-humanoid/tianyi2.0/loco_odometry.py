@@ -15,6 +15,8 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
+from common.capture_clock import host_clock_reference
+
 TOPIC = 'base/deadreckon_with_gyro_yaw'
 CLOCK_ID = 'host_realtime'
 UNCERTAINTY_NS = 50_000_000
@@ -92,6 +94,7 @@ class IncrementalOdometry:
     """
     def __init__(self, clock):
         self.clock = clock
+        self.clock_reference = host_clock_reference()
         self.segment = uuid.uuid4().hex
         self._last = None
         self._pending = []
@@ -186,7 +189,9 @@ class IncrementalOdometry:
                             'vendor': {'stamp_source': 'robot', 'source_stamp_ms': stamp,
                                        'motus_slam': {**self.status(), 'stamp_source': 'measurement',
                                                       'clock_id': CLOCK_ID, 'planar': True,
-                                                      'pose_reference': 'chassis_odometry',
+                                                      'pose_reference': 'body',
+                                                      'pose_source': 'chassis_odometry',
+                                                      'clock_reference': self.clock_reference,
                                                       'synchronization': 'bounded_software',
                                                       'timestamp_semantics': 'diagnostic_event_group',
                                                       'source_events_in_group': len(group),

@@ -403,3 +403,16 @@ def test_identical_nonzero_events_are_composed_and_closed_groups_cannot_be_repla
     with pytest.raises(ValueError,match='reorder'):
         odom.feed([delta(1050,x=.1)],EPOCH+1_080_000_000,1_080_000_000)
     assert odom.status()['status']=='lost'
+
+
+def test_normalized_pose_declares_actual_host_clock_reference(monkeypatch):
+    m = module()
+    reference = dict(clock_id='host_realtime', domain_id='actual-boot', timestamp_basis='host_realtime')
+    monkeypatch.setattr(m, 'host_clock_reference', lambda: reference)
+    odom = m.IncrementalOdometry(ready_clock(m))
+    poses = odom.feed([delta(1050), delta(1060)], EPOCH+1_070_000_000, 1_070_000_000)
+    q = poses[0]['vendor']['motus_slam']
+    assert q['clock_reference'] == reference
+    assert q['pose_reference'] == 'body'
+    assert q['pose_source'] == 'chassis_odometry'
+    assert q['measurement']['mapping']['uncertainty_ns'] == 50_000_000

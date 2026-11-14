@@ -90,3 +90,25 @@ policy; source calibration availability alone does not establish valid motion
 tracking or certified covariance.
 Software/offline acceptance does not establish real-device timing, calibration
 or estimator quality; hardware testing remains a separate acceptance step.
+
+### Dynamic chassis/cloud admission (PR371)
+
+Tianyi chassis poses now identify their normalized host realtime clock using the
+observed kernel boot identity in `vendor.motus_slam.clock_reference`. Pose type is
+`body`; the estimator remains identified by `pose_source=chassis_odometry`. This
+does not change timestamps, planar integration or the 50 ms software clock budget.
+After Orbbec global-mode source validation, camera_info declares the same host
+reference while preserving the original camera clock_id and capture headers.
+Global timestamps are exposure timestamps mapped to the host domain, unlike
+system timestamps (arrival): https://orbbec.github.io/OrbbecSDK_v2/docs/tutorial/timestamp.html
+The declaration proves neither hardware synchronization nor a camera mapping
+uncertainty bound; missing host identity omits the declaration and blocks this
+new dynamic route rather than creating a fictitious identity.
+
+PR371 routes the connected metric cloud's declaration and joins each pointcloud
+with its exact-capture body_mount matrix before native mapping. The original
+estimated matrices are unchanged. When using estimated TF, explicitly enable
+`camera_depth.estimated_body_tf` or `TIANYI_ESTIMATED_BODY_TF=1` and retain the
+capture-certificate companion. This option remains off by default; no external
+service is started or changed by these code updates. Camera-reference visual
+odometry and optional vendor.body_pose semantics are unchanged.
