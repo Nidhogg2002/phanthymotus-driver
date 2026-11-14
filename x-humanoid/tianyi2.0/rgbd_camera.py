@@ -412,9 +412,14 @@ class RgbdCameraPlugin:
         # Each motion stream has its own real frame and capture timestamp.
         transform = self.imu_buffer.lookup_transform(
             self.geometry['frame_id'], frame, Time.from_msg(msg.header.stamp))
+        if (transform.header.frame_id != self.geometry['frame_id'] or
+                transform.child_frame_id != frame):
+            raise ValueError('camera motion TF frame mismatch')
+        if _stamp(msg) <= 0 or _stamp(transform) != _stamp(msg):
+            raise ValueError('camera motion TF capture timestamp mismatch')
         q = transform.transform.rotation
         values = np.array([q.x, q.y, q.z, q.w], dtype=float)
-        if not np.isfinite(values).all() or not np.isclose(values @ values, 1., atol=1e-5):
+        if not np.isfinite(values).all() or not np.isclose(values @ values, 1., rtol=0., atol=1e-5):
             raise ValueError('camera motion TF quaternion is not a unit rotation')
         values /= np.linalg.norm(values)
         x, y, z, w = values
@@ -634,10 +639,12 @@ class RgbdCameraPlugin:
                     publish_depth = self._publishes('depth', _stamp(depth), epochs)
                     if not (publish_color or publish_depth):
                         continue
-                    self.body_mount.publish(_stamp(depth))
                     if publish_color:
+                        self.body_mount.publish(_stamp(color))
                         self.color_pub.publish(out_color)
                     if publish_depth:
+                        if not publish_color or _stamp(depth) != _stamp(color):
+                            self.body_mount.publish(_stamp(depth))
                         self.depth_pub.publish(out_depth)
                     self.count += 1
                     self.last_publish_ns = time.time_ns()

@@ -290,12 +290,17 @@ class DualDomainROS2:
     def start_spin(self):
         """Start spinning both executors in background threads."""
         def _spin(executor, name):
+            failures = 0
             while rclpy.ok(context=executor.context):
                 try:
                     executor.spin_once(timeout_sec=0.1)
                 except Exception as error:
                     if rclpy.ok(context=executor.context):
-                        print(f"[ros2] {name} callback failed: {error}", flush=True)
+                        failures += 1
+                        if failures == 1 or failures % 100 == 0:
+                            detail = ascii(str(error)[:240])[:240]
+                            print(f"[ros2] {name} callback failed (count={failures}): {detail}",
+                                  flush=True)
             print(f"[ros2] {name} spin exited")
 
         t1 = threading.Thread(target=_spin, args=(self.executor_tianyi, "domain0"), daemon=True)

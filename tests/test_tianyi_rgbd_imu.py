@@ -63,7 +63,8 @@ class Buffer:
         transform = NS(rotation=NS(x=x, y=y, z=z, w=w))
         if source in self.translations:
             transform.translation = self.translations[source]
-        return NS(transform=transform)
+        return NS(header=NS(frame_id=target, stamp=NS(sec=stamp.nanoseconds//10**9,
+                  nanosec=stamp.nanoseconds%10**9)), child_frame_id=source, transform=transform)
 
 
 class CallbackExecutor:
@@ -594,3 +595,24 @@ def test_managed_imu_restart_drops_late_pre_restart_accel(source):
     source._imu('accel', motion(NOW+12_000_000, 'accel_frame'))
     assert len(packets(source)) == 2
     assert packets(source)[-1]['accel_stamp_ns'] == NOW+12_000_000
+
+
+@pytest.mark.parametrize('field,value', [
+    ('parent', 'wrong_camera'), ('child', 'wrong_sensor'),
+    ('stamp', 0), ('stamp', NOW-1), ('stamp', NOW+1)])
+def test_motion_rejects_tf_for_other_frames_or_capture_times(source, field, value):
+    lookup = source.imu_buffer.lookup_transform
+    def invalid(*args):
+        transform = lookup(*args)
+        if field == 'parent':
+            transform.header.frame_id = value
+        elif field == 'child':
+            transform.child_frame_id = value
+        else:
+            transform.header.stamp = NS(sec=value//10**9, nanosec=value%10**9)
+        return transform
+    source.imu_buffer.lookup_transform = invalid
+    feed(source)
+    assert packets(source) == []
+    assert source._imu_status()['state'] == 'unavailable'
+    assert source.running and source.error is None

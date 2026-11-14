@@ -83,12 +83,14 @@ def source(monkeypatch):
     assert not plugin._source_spin.is_alive()
 
 
-def emit(source, stamp=STAMP):
+def emit(source, stamp=STAMP, color_stamp=None):
     header = NS(frame_id='head_optical', stamp=NS(sec=stamp//10**9, nanosec=stamp%10**9))
     color = NS(header=deepcopy(header), encoding='bgr8', width=640, height=480, step=1920,
                data=np.zeros((480, 640, 3), np.uint8).tobytes())
     depth = NS(header=deepcopy(header), encoding='16UC1', is_bigendian=False, width=640, height=480, step=1280,
                data=np.ones((480, 640), '<u2').tobytes())
+    if color_stamp is not None:
+        color.header.stamp = NS(sec=color_stamp//10**9, nanosec=color_stamp%10**9)
     source.stop_event.clear()
     source.pending.put((color, depth, dict(source.client_epochs)) if source.managed else (color, depth))
     source._work()
@@ -217,3 +219,29 @@ def test_restarting_after_source_error_releases_previous_mount_listener(source):
     source.start(); source.worker.join()
     assert listener.closed
     assert source.body_mount.listener is not listener
+
+
+@pytest.mark.parametrize('streams', [('color',), ('depth',), ('color', 'depth')])
+@pytest.mark.parametrize('offset', [0, 1_000_000])
+def test_mount_matches_each_published_capture(source, streams, offset):
+    source.managed = True
+    source.sub_node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=STAMP-1))
+    for stream in streams:
+        source.acquire(stream)
+    last = source.color_pub if streams == ('color',) else source.depth_pub
+    publish = last.publish
+    def finish(message):
+        publish(message)
+        source.stop_event.set()
+    last.publish = finish
+    emit(source, color_stamp=STAMP+offset)
+    expected = []
+    if 'color' in streams:
+        expected.extend([(source.root+'/body_mount', STAMP+offset), (source.color_topic, STAMP+offset)])
+    if 'depth' in streams:
+        if 'color' not in streams or offset:
+            expected.append((source.root+'/body_mount', STAMP))
+        expected.append((source.depth_topic, STAMP))
+    actual = [(topic, json.loads(msg.data)['stamp_ns'] if topic.endswith('/body_mount')
+               else m._stamp(msg)) for topic, msg in source.events]
+    assert actual == expected
