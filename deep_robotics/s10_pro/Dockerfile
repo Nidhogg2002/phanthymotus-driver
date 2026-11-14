@@ -37,6 +37,7 @@ COPY common/ /work/common/
 COPY main.py device.py basic_server.py domain_bridge.py loco_servo.py spatial.py media_workers.py undistortion.py front_depth.py depth_projection.py cloud_relay.py audio.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
 COPY resource/S10_kinematic.urdf /work/deep_robotics/s10_pro/resource/S10_kinematic.urdf
 COPY resource/ssh_known_hosts /work/deep_robotics/s10_pro/resource/ssh_known_hosts
+COPY resource/calibration/ /work/deep_robotics/s10_pro/resource/calibration/
 COPY deploy/ /deploy/
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 RCUTILS_COLORIZED_OUTPUT=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15745

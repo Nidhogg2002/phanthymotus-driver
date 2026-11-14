@@ -178,13 +178,20 @@ bundle startup only advertises the card.
 
 Keep the `camera_front` card's `undistort` setting enabled.
 Start the card normally; calibration and transport fields
-are not exposed in canvas settings. Deployment provisions the robot-specific
-calibration once, independently of canvas projects.
+are not exposed in canvas settings. The inspected robot's identity-bound
+calibration is included in the image and selected automatically. Other robots
+need their own calibration, independently of canvas projects.
 
 At each fresh start, the driver reads
 `/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json` (override with
 `S10_FRONT_CAMERA_EXTRINSICS`). This is a new deployment interface, not an
 existing factory file discovered on the robot. The driver only reads it.
+When the default path is absent and no maintenance matrix is configured, it
+reads the NOS `/etc/machine-id` SHA-256 over existing strict SSH and selects
+exactly one matching record under `resource/calibration/` in the image. No
+data-volume file is created. An explicit `S10_FRONT_CAMERA_EXTRINSICS` override
+never falls back to a bundled record, even when its path is missing. Present
+invalid deployment records also never fall back.
 The version-1 JSON object requires:
 
 | Field | Required meaning |
@@ -199,8 +206,9 @@ The version-1 JSON object requires:
 | `camera_axes` | `x_right_y_down_z_forward` |
 | `camera_optical_from_cloud` | Measured directed numeric 4x4 rigid transform |
 
-No example matrix is supplied: an identity or visual estimate is not a
-calibration. Missing records return `CALIBRATION_MISSING`; malformed records,
+No guessed default matrix is supplied: an identity or visual estimate is not a
+calibration. Missing or unmatched records return `CALIBRATION_MISSING`;
+an unavailable NOS identity returns `CALIBRATION_IDENTITY_UNAVAILABLE`. Malformed records,
 wrong camera/stream/topic/units/axes, or invalid matrices return
 `CALIBRATION_INVALID`. Start failures remain visible in `info`. A present invalid
 record cannot silently fall back to a previous or maintenance configuration.
@@ -210,9 +218,14 @@ For the robot inspected on 2026-11-14, the operator has confirmed the missing
 body/cloud and camera-axis relationships. Its derived mounting record is
 [`resource/calibration/s10_pro_cd1_inspected_20261114.json`](resource/calibration/s10_pro_cd1_inspected_20261114.json).
 It is scoped to that robot and preserves its manual/confirmation provenance.
-Future deployment must provision this already-generated record at the data
-path above; it is not a model-wide image fallback. It has not been deployed or
-verified by image/cloud reprojection.
+The image packages this record with `robot_identity.kind=nos_machine_id_sha256`
+and the inspected NOS identity digest. IP address and hardware model do not
+select it. The digest identifies the NOS operating-system installation, not
+an immutable robot serial number; replacing/reimaging NOS requires rechecking
+the binding and calibration. It is not a model-wide fallback. Each fresh start
+rechecks identity. This loader has been verified in a temporary in-memory
+probe on the actual NOS, without writing the calibration onto the robot;
+image/cloud reprojection remains unverified.
 
 ### Automatic point-cloud transport
 

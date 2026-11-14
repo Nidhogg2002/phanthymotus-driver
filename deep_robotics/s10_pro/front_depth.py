@@ -24,7 +24,7 @@ from deep_robotics.s10_pro.depth_projection import (
     depth_intrinsics, project_depth, validate_cloud_layout, validate_transform,
 )
 from deep_robotics.s10_pro.undistortion import CameraUndistortion, half_fov
-from deep_robotics.s10_pro.cloud_relay import CloudRelay
+from deep_robotics.s10_pro.cloud_relay import CloudRelay, read_robot_identity
 
 NAME = "camera_front__depth"
 FRAME = "s10_pro_camera_front_optical"
@@ -35,6 +35,7 @@ MAX_RESULT_AGE_S = 1.0
 SOURCE_TIMEOUT_S = 3.0
 CAMERA_ID = "deeprobotics/s10_pro/camera_front"
 FRONT_STREAM = "rtsp://10.21.33.103:8554/video4"
+BUNDLED_CALIBRATIONS = Path(__file__).with_name("resource") / "calibration"
 INPUT_ERROR_CODES = (None, "CLOUD_PUBLISHER_UNAVAILABLE", "CLOUD_DATA_TIMEOUT",
                      "CLOUD_RELAY_FAILED", "CLOUD_RELAY_STALE", "CLOUD_RELAY_DATA_TIMEOUT")
 DEFAULTS = {
@@ -226,6 +227,7 @@ class FrontDepthPlugin:
                          "/opt/phanthy-motus/data/s10_pro/camera_front_depth.json")
         self.extrinsics_path = Path(extrinsics_path or os.environ.get("S10_FRONT_CAMERA_EXTRINSICS") or
                                    "/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json")
+        self._allow_bundled_extrinsics = not (extrinsics_path or os.environ.get("S10_FRONT_CAMERA_EXTRINSICS"))
         self._front_stream = config.get("camera_rtsp", {}).get("camera_front", FRONT_STREAM)
         self._active_config = None
         self._optical_frame = FRAME
@@ -258,19 +260,44 @@ class FrontDepthPlugin:
             self._last_error = f"cannot load front-depth configuration: {exc}"
             self._error_code = "CONFIGURATION_INVALID"
 
+    def _bundled_extrinsics(self):
+        try:
+            identity = read_robot_identity(self._relay_config)
+        except (OSError, RuntimeError) as exc:
+            raise DepthError("CALIBRATION_IDENTITY_UNAVAILABLE",
+                "无法通过现有 SSH 确认本机标定身份，请检查 NOS 连接。") from exc
+        matches = []
+        try:
+            for path in sorted(BUNDLED_CALIBRATIONS.glob("*.json")):
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if record.get("robot_identity") == {"kind": "nos_machine_id_sha256", "value": identity}:
+                    matches.append((record, path))
+        except (OSError, ValueError, AttributeError, UnicodeError) as exc:
+            raise DepthError("CALIBRATION_INVALID", "镜像内的本机标定文件无法读取。") from exc
+        if not matches:
+            raise DepthError("CALIBRATION_MISSING", "未找到与本机身份匹配的前相机标定。")
+        if len(matches) != 1:
+            raise DepthError("CALIBRATION_INVALID", "本机身份对应多个标定文件，无法确定使用哪一个。")
+        return matches[0]
+
     def _load_extrinsics(self, settings):
         """Read deployment data; a present invalid record never falls back."""
+        path, source_prefix = self.extrinsics_path, "file:"
         try:
             record = json.loads(self.extrinsics_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            if settings["camera_optical_from_cloud"] is None:
+            if settings["camera_optical_from_cloud"] is not None:
+                if not settings["cloud_frame_id"]:
+                    raise DepthError("CALIBRATION_INVALID", "Calibration is missing cloud_frame_id")
+                return settings, FRAME, "maintenance-config"
+            if self._allow_bundled_extrinsics:
+                record, path = self._bundled_extrinsics()
+                source_prefix = "bundled:"
+            else:
                 raise DepthError("CALIBRATION_MISSING",
                     f"Front-camera extrinsics are unavailable: {self.extrinsics_path}. "
                     "A robot-specific calibration must be provisioned by deployment; "
                     "no mounting angle or identity transform is assumed.")
-            if not settings["cloud_frame_id"]:
-                raise DepthError("CALIBRATION_INVALID", "Calibration is missing cloud_frame_id")
-            return settings, FRAME, "maintenance-config"
         except (OSError, ValueError, UnicodeError) as exc:
             raise DepthError("CALIBRATION_INVALID",
                              f"Cannot read front-camera calibration {self.extrinsics_path}: {exc}") from exc
@@ -293,8 +320,8 @@ class FrontDepthPlugin:
                 raise ValueError("calibration camera_optical_from_cloud is missing")
         except (ValueError, KeyError, TypeError) as exc:
             raise DepthError("CALIBRATION_INVALID",
-                             f"Invalid front-camera calibration {self.extrinsics_path}: {exc}") from exc
-        return resolved, frame, "file:" + str(self.extrinsics_path)
+                             f"Invalid front-camera calibration {path}: {exc}") from exc
+        return resolved, frame, source_prefix + str(path)
 
     def _camera_info(self):
         calibration, source = self.controller.calibration("camera_front")

@@ -43,3 +43,17 @@ deployment calibration record using the manual position and these explicit
 premises; test directed projection and optical origin invariants. Scope the
 record to this inspected robot, preserve provenance and unverified reprojection
 status, and do not deploy it or make it a model-wide fallback.
+
+## Delivery bug fix: missing calibration in normal images
+
+A subsequent screenshot and read-only container check show the new loader is
+running but the deployment data file is absent. The previous Dockerfile did not
+include the generated per-robot record. Bundle that record as read-only image
+data, bind it to the inspected NOS `/etc/machine-id` SHA-256 read over existing
+strict SSH, and automatically select it only when no deployment or maintenance
+calibration is provided. Do not use IP, model or mounting position as identity.
+An explicit override, corrupt present file, unknown identity or failed query
+must not silently use this robot's profile. Reload identity on every fresh
+start; no filesystem writes or factory changes. Translation/rotation values
+and unverified reprojection status remain unchanged. A universal built-in
+transform is rejected; manual data-volume provisioning caused this defect.

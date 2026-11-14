@@ -149,3 +149,40 @@ still stops with the previously observed 80 collection errors from unavailable
 optional SDKs, Python 3.9 incompatibilities and duplicate module names; see
 `repository-pytest.log`. No dependency was installed. Independent review
 findings were fixed and rechecked with no remaining actionable findings.
+
+## Follow-up: new loader running, deployment calibration absent
+
+A subsequent startup screenshot reports `CALIBRATION_MISSING`. Read-only
+inspection now confirms the current container includes `cloud_relay.py` but
+still has no `/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json`.
+The initial Dockerfile omitted `resource/calibration/`, and the loader had no
+normal-image path to the already generated record. Pushing code alone did not
+provision that external file. This is a calibration delivery defect, before
+any point-cloud subscription or hole filling can begin.
+
+The fix packages the existing record as image data and binds it to SHA-256 of
+the inspected NOS `/etc/machine-id`. A default start with an empty data volume
+queries that identity over existing strict SSH, without ROS or file writes,
+and selects exactly one matching bundled record. Deployment files and complete
+maintenance settings retain precedence. An explicit missing override, invalid
+file, unknown or duplicate identity, or failed SSH query never substitutes
+another robot's matrix. Existing translation, rotation and stream binding
+checks remain unchanged. Identity is rechecked on each fresh start.
+
+This identifies the NOS installation, not immutable physical hardware;
+replacement/reimaging requires checking the binding and calibration again.
+No IP address or model-wide mounting transform is used as identity.
+
+New artifacts are in
+`/Users/4paradigm/Desktop/shixi/diagnostics/s10-depth-bundled-calibration-20261114/`.
+`live-loader.json` confirms the real NOS identity matches the generated record
+and the unchanged matrix loads from `bundled:` while the deployment file
+remains absent. The temporary probe executes the new loader and record from
+memory; it does not deploy a source file, start a business service, or publish
+ROS data. Regression tests stage the calibration using the actual Docker
+`COPY` source and reproduce startup with an empty volume. This verifies source
+packaging and loading, not a rebuilt/deployed image. Focused regression:
+**304 passed, 9 skipped**. Independent review reports no actionable findings.
+Repository-wide pytest retains the known 80 collection errors; logs record
+the unavailable optional SDKs, Python 3.9 incompatibilities and module-name
+collisions. No dependencies or robot configuration were changed.

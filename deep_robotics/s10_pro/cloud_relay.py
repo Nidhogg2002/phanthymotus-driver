@@ -123,12 +123,6 @@ def read_packet(read, topic):
 def ssh_command(config, topic):
     if not isinstance(topic, str) or not re.fullmatch(r'/[A-Za-z_][A-Za-z0-9_/]*', topic):
         raise ValueError('cloud relay requires an absolute ROS topic')
-    spatial = config.get('controlled_spatial', {})
-    host = os.environ.get('S10_DRMAP_SSH_HOST') or spatial.get('ssh_host', '10.21.33.106')
-    user = os.environ.get('S10_DRMAP_SSH_USER') or spatial.get('ssh_user', 'user')
-    password = os.environ.get('S10_DRMAP_PASSWORD', '')
-    known_hosts = os.environ.get('S10_SSH_KNOWN_HOSTS') or str(
-        Path(__file__).with_name('resource') / 'ssh_known_hosts')
     domain = int(config.get('ros', {}).get('robot_domain_id', 0))
     encoded = base64.b64encode(Path(__file__).read_bytes()).decode('ascii')
     python = ['python3', '-u', '-c', f'exec(__import__("base64").b64decode("{encoded}"))',
@@ -136,6 +130,16 @@ def ssh_command(config, topic):
     setup = ('set -e; source /opt/ros/jazzy/setup.bash 1>&2; '
              'export PYTHONDONTWRITEBYTECODE=1 ROS_LOCALHOST_ONLY=1; exec ' + shlex.join(python))
     command = 'exec bash --noprofile --norc -c ' + shlex.quote(setup)
+    return _ssh_command(config, command)
+
+
+def _ssh_command(config, command):
+    spatial = config.get('controlled_spatial', {})
+    host = os.environ.get('S10_DRMAP_SSH_HOST') or spatial.get('ssh_host', '10.21.33.106')
+    user = os.environ.get('S10_DRMAP_SSH_USER') or spatial.get('ssh_user', 'user')
+    password = os.environ.get('S10_DRMAP_PASSWORD', '')
+    known_hosts = os.environ.get('S10_SSH_KNOWN_HOSTS') or str(
+        Path(__file__).with_name('resource') / 'ssh_known_hosts')
     args = ['ssh', '-T', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=yes',
             '-o', f'UserKnownHostsFile={known_hosts}', '-o', 'GlobalKnownHostsFile=/dev/null',
             '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2', '--',
@@ -147,6 +151,24 @@ def ssh_command(config, topic):
         env['SSHPASS'] = password
         return ['sshpass', '-e', *args], env
     return ['ssh', '-o', 'BatchMode=yes', *args[1:]], None
+
+
+def read_robot_identity(config):
+    # Identify the NOS host without exposing its raw machine-id or loading ROS.
+    script = ('import hashlib,pathlib,re; '
+              'value=pathlib.Path("/etc/machine-id").read_bytes().strip(); '
+              'assert re.fullmatch(b"[0-9a-f]{32}",value); '
+              'print(hashlib.sha256(value).hexdigest())')
+    args, env = _ssh_command(config, 'exec ' + shlex.join(['python3', '-I', '-B', '-c', script]))
+    try:
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=10., check=False, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError('Cannot read NOS calibration identity over existing SSH') from exc
+    value = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(b'[0-9a-f]{64}', value):
+        raise RuntimeError('Invalid NOS calibration identity response')
+    return value.decode('ascii')
 
 
 def _signal(process, value):

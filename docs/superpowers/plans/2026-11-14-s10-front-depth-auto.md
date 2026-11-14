@@ -45,3 +45,11 @@
 - [x] Record paired native subscriptions and passive RTPS locator evidence; do not deploy a workaround.
 - [x] Run relevant S10 tests and repository pytest; report pre-existing failures and unavailable dependencies separately.
 - [x] Review the final diff, verify documented file/schema contracts and build inclusion, and leave code locally reviewable without pushing or deployment.
+
+### Task 3: Empty-volume deployment regression
+
+- [x] Reproduce missing bundled record and identity-query errors before changes.
+- [x] Bind the existing record to the inspected NOS identity; package it in Docker.
+- [x] Reuse strict NOS SSH and automatically load only an exact identity match.
+- [x] Verify override precedence, unknown/error rejection, restart identity, image packaging and focused regression.
+- [x] Verify bounded in-memory loader against the actual NOS, review and document the deployment boundary.

@@ -208,6 +208,97 @@ def test_confirmed_robot_transform_maps_its_optical_centre_to_zero():
     assert transformed == pytest.approx([0, 0, 0, 1])
 
 
+def automatic_plugin(rig, monkeypatch, identity):
+    monkeypatch.delenv('S10_FRONT_CAMERA_EXTRINSICS')
+    monkeypatch.setattr(module(), 'read_robot_identity', lambda config: identity, raising=False)
+    plugin = module().FrontDepthPlugin({}, 'robot', rig.nodes, config_path=rig.path)
+    # Reproduce a fresh deployment with an empty data volume.
+    plugin.extrinsics_path = rig.extrinsics_path
+    return plugin
+
+
+def test_empty_data_volume_automatically_loads_only_this_robots_bundled_calibration(rig, monkeypatch):
+    plugin = automatic_plugin(rig, monkeypatch,
+        '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
+    result = plugin.dispatch('start', {})
+    try:
+        assert result['state'] == 'running', result
+        assert result['config']['cloud_frame_id'] == 'lidar_link'
+        assert result['config']['camera_optical_from_cloud'] == [
+            [0, -1, 0, 0], [0, 0, -1, .04673],
+            [1, 0, 0, -.27065], [0, 0, 0, 1]]
+        assert result['camera_info'][0]['vendor']['extrinsics_source'].startswith('bundled:')
+        assert not rig.extrinsics_path.exists() and not rig.path.exists()
+    finally:
+        plugin.stop()
+
+
+def test_unknown_robot_does_not_reuse_inspected_robots_calibration(rig, monkeypatch):
+    plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
+    result = plugin.dispatch('start', {})
+    assert result['code'] == 'CALIBRATION_MISSING' and not rig.subscriptions
+
+
+def test_identity_read_failure_is_explicit_and_does_not_start_cloud_reader(rig, monkeypatch):
+    plugin = automatic_plugin(rig, monkeypatch, None)
+    def unavailable(config):
+        raise RuntimeError('identity unavailable')
+    monkeypatch.setattr(module(), 'read_robot_identity', unavailable)
+    result = plugin.dispatch('start', {})
+    assert result['code'] == 'CALIBRATION_IDENTITY_UNAVAILABLE'
+    assert not rig.subscriptions and not rig.relays
+
+
+def test_explicit_missing_calibration_path_does_not_use_bundled_record(rig, monkeypatch):
+    def unexpected(config):
+        pytest.fail('an explicit missing calibration must not perform identity discovery')
+    monkeypatch.setattr(module(), 'read_robot_identity', unexpected, raising=False)
+    assert rig.plugin.dispatch('start', {})['code'] == 'CALIBRATION_MISSING'
+
+
+def test_present_invalid_deployment_record_does_not_use_bundled_record(rig, monkeypatch):
+    plugin = automatic_plugin(rig, monkeypatch,
+        '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
+    rig.extrinsics_path.write_text('{}')
+    assert plugin.dispatch('start', {})['code'] == 'CALIBRATION_INVALID'
+    assert not rig.subscriptions
+
+
+def test_bundled_calibration_rechecks_identity_after_stop(rig, monkeypatch):
+    plugin = automatic_plugin(rig, monkeypatch,
+        '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
+    assert plugin.dispatch('start', {})['state'] == 'running'
+    plugin.stop()
+    monkeypatch.setattr(module(), 'read_robot_identity', lambda config: '0' * 64)
+    assert plugin.dispatch('start', {})['code'] == 'CALIBRATION_MISSING'
+
+
+def test_image_copied_calibration_can_start_with_an_empty_volume(rig, monkeypatch, tmp_path):
+    import shlex
+    import shutil
+    image_root = tmp_path / 'image'
+    # Stage the actual Docker COPY sources for calibration, not a test fixture.
+    for line in (DRIVER / 'Dockerfile').read_text().splitlines():
+        if not line.startswith('COPY ') or '--from=' in line:
+            continue
+        *sources, destination = shlex.split(line)[1:]
+        if '/resource/calibration' not in destination:
+            continue
+        target = image_root / destination.lstrip('/')
+        for source in sources:
+            shutil.copytree(DRIVER / source, target, dirs_exist_ok=True)
+    monkeypatch.setattr(module(), 'BUNDLED_CALIBRATIONS',
+                        image_root / 'work/deep_robotics/s10_pro/resource/calibration')
+    plugin = automatic_plugin(rig, monkeypatch,
+        '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
+    try:
+        result = plugin.dispatch('start', {})
+        assert result['state'] == 'running', result
+        assert not rig.extrinsics_path.exists()
+    finally:
+        plugin.stop()
+
+
 @pytest.mark.parametrize("changes", [
     {"version": 2}, {"version": True}, {"translation_unit": "mm"},
     {"camera_axes": "x_forward_y_left_z_up"},
