@@ -179,3 +179,30 @@ def test_missing_tf_reason_names_selected_frames_even_for_generic_lookup_error(s
     mount.buffer.failure = LookupError('not found')
     assert mount.publish(123) is False
     assert 'base_link' in node.messages[-1]['reason'] and 'optical' in node.messages[-1]['reason']
+
+def test_estimated_capture_gate_never_falls_back_to_interpolated_tf(source):
+    mount, node = source
+    class Evidence:
+        provenance = dict(calibration_kind='estimate', accuracy_validated=False)
+        def lookup(self, *args):
+            raise ValueError('no exact estimated capture certificate')
+    mount.capture_evidence = Evidence()
+    assert not mount.publish(12_345_678_901)
+    assert not mount.buffer.calls
+    packet = node.messages[-1]
+    assert packet['status'] == 'unavailable' and 'matrix' not in packet
+    assert packet['provenance']['calibration_kind'] == 'estimate'
+
+def test_estimated_capture_preserves_provenance_and_matrix(source):
+    mount, node = source
+    class Evidence:
+        provenance = dict(calibration_kind='estimate', accuracy_validated=False)
+        def lookup(self, stamp, parent, child, clock):
+            assert (stamp,parent,child,clock) == (12_345_678_901,'base_link','optical','capture')
+            matrix = np.eye(4);matrix[2,3]=1.5
+            return matrix.tolist()
+    mount.capture_evidence=Evidence()
+    assert mount.publish(12_345_678_901)
+    assert not mount.buffer.calls
+    assert node.messages[-1]['matrix'][2][3] == 1.5
+    assert node.messages[-1]['accuracy_validated'] is False

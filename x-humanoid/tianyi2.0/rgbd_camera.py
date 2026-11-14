@@ -161,6 +161,28 @@ class RgbdCameraPlugin:
         self.imu_last_stamp = 0
         self.imu_publication_attempts = self.imu_max_capture_gap_ns = 0
         self.imu_translation_reason = 'waiting for camera motion TF translation'
+        self.estimate_evidence = None
+        if config.get('estimated_body_tf', False) or os.environ.get('TIANYI_ESTIMATED_BODY_TF') == '1':
+            from estimated_body_tf import CaptureEvidence
+            from pathlib import Path
+            from std_msgs.msg import String
+            from rclpy.qos import qos_profile_sensor_data
+            estimate_config = json.loads((Path(__file__).parent/'resource/body_tf_estimate.json').read_text())
+            self.estimate_evidence = CaptureEvidence(estimate_config)
+            def observe_estimate(msg):
+                try:
+                    self.estimate_evidence.observe(json.loads(msg.data))
+                except (ValueError, TypeError, AttributeError):
+                    pass  # malformed evidence cannot authorize a capture
+            # Internal evidence stays on domain 0: domain-42 subscriptions are
+            # redirected through the external socket bridge. A dedicated
+            # executor prevents high-rate body callbacks from dropping evidence.
+            self.estimate_node = Node('tianyi_capture_evidence', context=ros2.ctx_tianyi)
+            self.estimate_executor = SingleThreadedExecutor(context=ros2.ctx_tianyi)
+            self.estimate_executor.add_node(self.estimate_node)
+            self.estimate_node.create_subscription(String, '/tianyi_estimated_body_tf/captures',
+                observe_estimate, qos_profile_sensor_data)
+            threading.Thread(target=self._spin_evidence, name='tianyi_capture_evidence', daemon=True).start()
         self.body_mount = None
         self._camera_executor = None
         self.imu_node = None
@@ -183,6 +205,18 @@ class RgbdCameraPlugin:
             self._camera_spin = threading.Thread(target=self._spin_camera, name='tianyi_rgbd_ros', daemon=True)
             self._camera_spin.start()
             self._camera_context.on_shutdown(self._shutdown_camera)
+
+    def _spin_evidence(self):
+        import rclpy
+        from rclpy.executors import ExternalShutdownException, ShutdownException
+        try:
+            while rclpy.ok(context=self._body_context):
+                self.estimate_executor.spin_once(timeout_sec=.05)
+        except (ExternalShutdownException, ShutdownException):
+            pass
+        finally:
+            self.estimate_executor.shutdown(timeout_sec=5)
+            self.estimate_node.destroy_node()
 
     def _spin_source(self):
         from rclpy.executors import ExternalShutdownException, ShutdownException
@@ -377,7 +411,7 @@ class RgbdCameraPlugin:
             self.body_mount = BodyMountSource(_MountNode(self.sub_node, self.pub_node), self.root,
                 body_frame=os.environ.get('CAMERA_BODY_FRAME', 'base_link'),
                 camera_frame=lambda: self.geometry['frame_id'] if self.geometry is not None else None,
-                clock_id=lambda: self.clock)
+                clock_id=lambda: self.clock, capture_evidence=self.estimate_evidence)
             self.stop_event.clear()
             self.worker = threading.Thread(target=self._work, name='tianyi_rgbd_source', daemon=True)
             self.worker.start()

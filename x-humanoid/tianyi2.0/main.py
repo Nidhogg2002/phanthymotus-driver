@@ -329,6 +329,7 @@ class TianyiDeviceBundle:
             from rgbd_camera import RgbdCameraPlugin, RgbdInputCard
             rgbd_source = RgbdCameraPlugin(
                 {"imu_enabled": plugins_cfg.get("imu", {}).get("enabled", False),
+                 "estimated_body_tf": plugins_cfg.get("camera_depth", {}).get("estimated_body_tf", False),
                  "hz": plugins_cfg.get("camera_depth", {}).get("hz", 8)}, namespace, ros2, managed=True)
 
         if plugins_cfg.get("state", {}).get("enabled", False):

@@ -27,7 +27,8 @@ def _matrix(transform, parent, child, stamp_ns):
 
 
 class BodyMountSource:
-    def __init__(self, node, root, *, body_frame, camera_frame, clock_id):
+    def __init__(self, node, root, *, body_frame, camera_frame, clock_id, capture_evidence=None):
+        self.capture_evidence = capture_evidence
         self.node, self.topic = node, root + '/body_mount'
         self.body_frame, self.camera_frame, self.clock_id = body_frame, camera_frame, clock_id
         self.publisher = self.buffer = self.listener = None
@@ -55,12 +56,16 @@ class BodyMountSource:
         return value() if callable(value) else value
 
     def declaration(self):
-        return dict(schema='motus.camera_mount/1', topic=self.topic,
+        result = dict(schema='motus.camera_mount/1', topic=self.topic,
                     parent_frame=self._value(self.body_frame), child_frame=self._value(self.camera_frame),
                     source='tf', version='capture_tf_v1', epoch=self.epoch, mode='dynamic',
                     length_unit='m', transform_direction='body_from_camera',
                     status='unavailable' if self._reason else 'available', reason=self._reason,
                     accuracy_validated=False)
+        if self.capture_evidence is not None:
+            result['provenance'] = self.capture_evidence.provenance
+            result['synchronization_budget_ns'] = 50_000_000
+        return result
 
     def status(self):
         return dict(self.declaration(), stamp_ns=self._stamp_ns)
@@ -84,11 +89,15 @@ class BodyMountSource:
                 raise ValueError('body frame must differ from camera optical frame')
             if self._setup_reason:
                 raise RuntimeError(self._setup_reason)
-            from rclpy.time import Time
-            from rclpy.clock import ClockType
-            capture_time = Time(nanoseconds=stamp_ns, clock_type=ClockType.ROS_TIME)
-            transform = self.buffer.lookup_transform(packet['parent_frame'], packet['child_frame'], capture_time)
-            packet['matrix'] = _matrix(transform, packet['parent_frame'], packet['child_frame'], stamp_ns)
+            if self.capture_evidence is not None:
+                packet['matrix'] = self.capture_evidence.lookup(
+                    stamp_ns, packet['parent_frame'], packet['child_frame'], packet['clock_id'])
+            else:
+                from rclpy.time import Time
+                from rclpy.clock import ClockType
+                capture_time = Time(nanoseconds=stamp_ns, clock_type=ClockType.ROS_TIME)
+                transform = self.buffer.lookup_transform(packet['parent_frame'], packet['child_frame'], capture_time)
+                packet['matrix'] = _matrix(transform, packet['parent_frame'], packet['child_frame'], stamp_ns)
         except Exception as error:
             self._reason = 'body mount unavailable: ' + str(error)
             if packet is not None:

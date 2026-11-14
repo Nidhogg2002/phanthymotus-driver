@@ -1091,3 +1091,47 @@ VOP/Measure connections. If Measure overlays an RGB image, set its existing
 `camera_topic` to that topic rather than relying on its `/camera/color` or
 `/camera/rgb` default guesses.
 No camera-to-body matrix or guessed calibration is introduced by this wiring.
+
+### Opt-in estimated capture-time body chain
+
+`plugins.camera_depth.estimated_body_tf: true` enables the estimated mount
+certificate gate for the shared camera source. It defaults to false. Run
+`python3 /work/estimated_body_tf.py` in the driver container after sourcing
+ROS and `/tianyi_ws/install/setup.bash`, with the vendor DDS profile and
+`PYTHONPATH=/work`. Authenticate the read-only motion-board clock probe with
+`MOTION_CLOCK_PASSWORD` from the deployment environment, or an SSH key.
+Never put credentials in the image or configuration tracked in Git.
+
+`resource/body_tf_estimate.json` pins the audited XARM V1.2.27 chain and motor
+mapping: first leg pitch is motor 52; second leg pitch is motor 51 minus 52.
+The body origin and public head-camera extrinsic are **estimates**, not physical
+measurements. Their provenance and `accuracy_validated: false` remain in the
+configuration and mount diagnostics; no additional card prompt is needed.
+The companion composes base-to-camera-root with the inverse native optical
+transform, preserving the camera driver's existing optical TF parent.
+
+Persistent SSH round trips refresh the motion-to-host clock mapping every
+250 ms. A calibration round trip over 8 ms is rejected; the last accepted
+mapping expires after 2 seconds. Each image requires joint samples bracketing
+its capture, with bracket width plus clock uncertainty and drift allowance
+at most 50 ms. Expired mappings, clock discontinuities, stale captures and
+missing brackets produce no valid certificate. This is a bounded software
+synchronization policy, not proof of hardware acquisition accuracy.
+
+Internal exact-capture certificates travel on domain 0, outside the domain-42
+socket bridge. The camera publishes the corresponding body-mount packet through
+its normal bridge before each image. It never fills missing certificates using
+TF interpolation or a held matrix. The existing RGB-D consumer can attach a
+separate body pose; its main camera odometry and SLAM camera reference remain
+unchanged. This does not certify the raw native PointCloud2 input for direct
+chassis-odometry SLAM.
+
+For an opt-in persistent deployment, install `deploy/estimated-body-tf.service`
+as a user service and create `~/.config/phanthy/tianyi-motion-clock.env` with
+mode 0600 containing the clock credential. Enable with
+`systemctl --user enable --now estimated-body-tf.service`. The container must
+contain this version and enable the configuration above. The service retries
+when the driver restarts; boot startup also requires the user's service manager
+to be enabled at boot. To roll back, disable the user service, set
+`estimated_body_tf: false`, and restart the driver. The hardware camera must
+remain in global time mode throughout.
