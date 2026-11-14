@@ -256,3 +256,14 @@ def test_clock_reference_only_declared_after_global_source_confirmation(source, 
     assert values[0]['vendor']['clock_id'] == source.clock
     source.registered = False
     assert 'clock_reference' not in source._declarations()[0]['vendor']
+
+
+def test_rgbd_worker_uses_selected_depth_compressor(source):
+    import zlib
+    calls = []
+    def compress(data, level):
+        calls.append((len(data), level))
+        return zlib.compress(data, level)
+    source._compress_depth = compress
+    emit(source)
+    assert calls == [(640 * 480 * 2, 1)]

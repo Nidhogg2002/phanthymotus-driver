@@ -13,12 +13,21 @@ import queue
 import threading
 import time
 import uuid
-import zlib
 
 import numpy as np
 
 from common.camera_mount import BodyMountSource
 from common.capture_clock import host_clock_reference
+
+
+def depth_compressor():
+    """Keep the installed accelerated backend and the RFC1950 wire format."""
+    try:
+        from deflate import zlib_compress
+        return zlib_compress, 'libdeflate'
+    except ImportError:
+        from zlib import compress
+        return compress, 'stdlib-zlib-fallback'
 
 
 def make_geometry(color, depth, *, registered):
@@ -123,6 +132,7 @@ class RgbdCameraPlugin:
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
         self.root = '/' + namespace + '/camera/rgbd'
+        self._compress_depth, self.compression_backend = depth_compressor()
         self.managed, self.clients = managed, {}
         self.client_epochs = {}
         self.lifecycle_lock = threading.RLock()
@@ -674,7 +684,7 @@ class RgbdCameraPlugin:
                 out_color.header, out_depth.header = deepcopy(color.header), deepcopy(depth.header)
                 out_color.format, out_color.data = 'jpeg', array('B', jpg.tobytes())
                 out_depth.format = '16UC1; compressedDepth zlib'
-                out_depth.data = array('B', zlib.compress(metric.astype('<u2', copy=False).tobytes(), 1))
+                out_depth.data = array('B', self._compress_depth(metric.astype('<u2', copy=False).tobytes(), 1))
                 with self.lock:
                     if not self.running or self.stop_event.is_set():
                         continue

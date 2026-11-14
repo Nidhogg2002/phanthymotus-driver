@@ -357,14 +357,16 @@ class _Executor:
         self.node = node
 
 
-def test_hardware_depth_is_raw_relayed_with_depth_one_qos(monkeypatch):
+@pytest.mark.parametrize("topic", ["/nvidia_desktop/camera/head/depth/visual_depth",
+                                  "/nvidia_desktop/camera/head/depth"])
+def test_hardware_depth_is_raw_relayed_with_depth_one_qos(monkeypatch, topic):
     server = _server_module()
     monkeypatch.setattr(server, "Node", _ServerNode)
     monkeypatch.setattr(
         server, "QoSProfile", lambda **kwargs: types.SimpleNamespace(**kwargs))
     payload = bytes(range(256)) * 1200
     handler = server.TopicHandler(
-        "/nvidia_desktop/camera/head/depth/visual_depth",
+        topic,
         "std_msgs/msg/FakeMsg", object(), _Executor(),
         {"reliability": "best_effort", "depth": 1},
     )
