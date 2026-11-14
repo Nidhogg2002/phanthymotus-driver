@@ -197,18 +197,33 @@ class MotionClock:
         self.worker.join(timeout=4)
 
 
+def clock_pair(wall_ns=time.time_ns, mono_ns=time.monotonic_ns):
+    # Bracket the wall read so thread preemption cannot masquerade as a clock step.
+    for _ in range(3):
+        before = mono_ns()
+        wall = wall_ns()
+        after = mono_ns()
+        if 0 <= after-before <= 1_000_000:
+            return wall, (before+after)//2
+    raise ValueError('host clock sampling delayed')
+
+
 class CaptureEvidence:
     """Exact-capture certificates; never fills rejected gaps through TF interpolation."""
     def __init__(self, config, *, wall_ns=time.time_ns, mono_ns=time.monotonic_ns):
         self.provenance = config['provenance']
         self.wall_ns, self.mono_ns = wall_ns, mono_ns
-        self.last_clock = (wall_ns(), mono_ns())
+        self.last_clock = clock_pair(wall_ns, mono_ns)
         self.packets, self.epoch = {}, None
         self.retired_epoch = None
         self.lock = threading.Condition(threading.RLock())
 
     def _clock_check(self):
-        wall, mono = self.wall_ns(), self.mono_ns()
+        try:
+            wall, mono = clock_pair(self.wall_ns, self.mono_ns)
+        except ValueError:
+            self.packets.clear()
+            return False
         stepped = abs((wall-self.last_clock[0])-(mono-self.last_clock[1])) > 2_000_000
         self.last_clock = wall, mono
         if stepped:
@@ -218,7 +233,8 @@ class CaptureEvidence:
 
     def observe(self, packet):
         with self.lock:
-            self._clock_check()
+            if not self._clock_check():
+                return
             if self.retired_epoch is not None and packet.get('epoch') == self.retired_epoch:
                 return
             if packet.get('epoch') != self.epoch:
@@ -308,7 +324,7 @@ def main():
     status_pub = node.create_publisher(String, '/tianyi_estimated_body_tf/status', 1)
     evidence_pub = node.create_publisher(String, '/tianyi_estimated_body_tf/captures', 100)
     epoch = [uuid.uuid4().hex]
-    last_clock = [time.time_ns(), time.monotonic_ns()]
+    last_clock = list(clock_pair())
     pending, seen = set(), set()
     state = dict(status='unavailable', reason='waiting for capture and joints', published=0,
                  dropped=0, last_stamp_ns=0, max_sync_bound_ns=0,
@@ -331,7 +347,10 @@ def main():
         state['dropped'] += queue_capture(stamp, pending, seen)
 
     def publish_ready():
-        wall, mono = time.time_ns(), time.monotonic_ns()
+        try:
+            wall, mono = clock_pair()
+        except ValueError:
+            return
         if abs((wall-last_clock[0])-(mono-last_clock[1])) > 2_000_000:
             pending.clear()
             seen.clear()

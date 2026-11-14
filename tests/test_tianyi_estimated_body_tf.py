@@ -190,3 +190,22 @@ def test_color_capture_arriving_after_newer_depth_is_not_discarded():
     pending.clear()
     m.queue_capture(10_000_000_000, pending, seen)
     assert not pending  # duplicate capture still suppressed
+
+
+def test_scheduler_pause_between_clock_reads_is_not_a_clock_reset(estimator):
+    e, _ = estimator
+    clocks = [10_000_000_000, 0]
+    pause = [False]
+    def wall():
+        result = clocks[0]
+        if pause[0]:
+            clocks[0] += 10_000_000
+            clocks[1] += 10_000_000
+            pause[0] = False
+        return result
+    evidence = m.CaptureEvidence(e.config, wall_ns=wall, mono_ns=lambda: clocks[1])
+    evidence.observe({'epoch': 'a', 'stamp_ns': 10_000_000_000})
+    pause[0] = True
+    evidence.observe({'epoch': 'a', 'stamp_ns': 10_001_000_000})
+    assert evidence.retired_epoch is None
+    assert 10_001_000_000 in evidence.packets
