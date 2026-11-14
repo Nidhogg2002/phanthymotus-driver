@@ -151,6 +151,22 @@ PR371's input validator: both main/depth declare JPEG, and measured
 `image/depth-zlib` is missing. Existing platform contract/IMU/depth-only
 regressions passed (75 tests); no platform code was changed.
 
+## Patch verification
+
+The four final real-pipe regressions fail against pristine base code and pass
+with this patch. R1/camera related tests pass: 128 on Python 3.12; the four new
+tests also pass on Python 3.10. Independent review found no blocking issues
+and separately reverted each fix in memory to confirm its regression fails.
+
+A broad repository run with `pytest -q --continue-on-collection-errors` did
+not pass: 437 failed, 4819 passed, 56 skipped, 90 errors, 918 subtests passed.
+It includes missing optional/hardware packages, cross-bundle module import
+collisions and callback TLS/fixture failures. All 76 collection-error file
+names also occur when collecting a pristine base extraction (which has one
+additional error); this does not establish that every execution failure is
+pre-existing. The broad run is not a successful full regression. Complete
+failure names/logs are retained locally; unrelated code was not modified.
+
 Local evidence capture SHA-256:
 `5a1e8984e732f4933dc08018cfa85b36e438b82f1cc6b9408bb09404b53304f5`
 (`video-passive.pcap`, 6,317,288 bytes). Raw images/packet data remain local;
