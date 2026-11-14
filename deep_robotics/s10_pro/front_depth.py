@@ -102,6 +102,8 @@ def _put_latest(target, value):
 
 
 def _project_worker(jobs, results):
+    from common import logsafe
+    logsafe.install(check_fd=False)
     while True:
         job = jobs.get()
         if job is None:

@@ -349,3 +349,42 @@ class DurabilityPolicy:VOLATILE='volatile'
             process.wait(timeout=3)
         process.stdout.close()
         process.stderr.close()
+
+
+def test_remote_entrypoint_isolates_native_and_python_noise_from_binary_pipe():
+    # This is the remote SSH process, not the driver's container stdout. Exercise
+    # real descriptors and the actual entrypoint; stub only the unavailable ROS.
+    script = r'''
+import builtins, os, sys, time
+from types import SimpleNamespace as NS
+from deep_robotics.s10_pro.cloud_relay import remote_main
+class Node:
+    def __init__(self, *args, **kwargs): pass
+    def create_subscription(self, *args, **kwargs): return object()
+    def destroy_node(self): pass
+sys.modules.update({
+    'rclpy': NS(spin_once=lambda *a, **k: time.sleep(.01), shutdown=lambda: None),
+    'rclpy.node': NS(Node=Node),
+    'rclpy.parameter': NS(Parameter=lambda *a, **k: None),
+    'rclpy.qos': NS(QoSProfile=lambda **k: None,
+                   ReliabilityPolicy=NS(BEST_EFFORT=1), DurabilityPolicy=NS(VOLATILE=1)),
+    'rclpy.utilities': NS(get_default_context=lambda: NS(init=lambda **k: None)),
+    'sensor_msgs.msg': NS(PointCloud2=object),
+})
+original_import = builtins.__import__
+def noisy_import(name, *a, **k):
+    if name == 'rclpy':
+        print('python diagnostic', flush=True)
+        os.write(1, b'native stdout diagnostic\n')
+        os.write(2, b'native stderr diagnostic\n')
+    return original_import(name, *a, **k)
+builtins.__import__ = noisy_import
+sys.argv = ['reader', '--topic', '/LIDAR/POINTS']
+remote_main()
+'''
+    result = subprocess.run([sys.executable, '-u', '-c', script], input=b'N\n',
+                            capture_output=True, timeout=5, check=True)
+    assert result.stdout == packet({'kind': 'idle', 'topic': '/LIDAR/POINTS'}, b'')
+    assert b'python diagnostic\n' in result.stderr
+    assert b'native stdout diagnostic\n' in result.stderr
+    assert b'native stderr diagnostic\n' in result.stderr

@@ -286,7 +286,12 @@ class CloudRelay:
 
 def remote_main():
     import argparse
-    # Keep Python and native ROS diagnostics out of the binary data channel.
+    # SSH-only entrypoint on NOS, never called in the driver container. Its
+    # stdout is a private binary transport pipe (Popen(stdout=PIPE)), not the
+    # container log. Preserve that pipe for the sole packet writer before ROS
+    # imports; Python/native diagnostics go to the separate SSH stderr stream.
+    # Do not apply logsafe to this binary stream or remove this isolation merely
+    # to follow the container-log rule: either would corrupt cloud packets.
     output = os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     parser = argparse.ArgumentParser()
