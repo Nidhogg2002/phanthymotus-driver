@@ -642,3 +642,25 @@ RGB. This also applies to VOP/Measure connections. If Measure overlays an RGB
 image, set its existing `camera_topic` to that registered RGB topic; its default
 `/camera/color` or `/camera/rgb` guess refers to the native display image.
 No camera-to-body matrix or guessed calibration is introduced by this wiring.
+
+### Camera-reference SLAM with generic Perception
+
+Connect `/<ns>/camera/rgbd/color` and `/<ns>/camera/depth` to the generic
+`rgbd_odometry` card. Also connect the depth port to `pointcloud`, then connect
+the metric cloud and generic RGB-D odometry outputs to `pointcloud_slam`.
+Both outputs refer to the same depth optical frame; no camera-to-body matrix
+is needed for this route. The resulting pose describes the camera, not the
+robot body. The native display RGB and gyro-only chassis odometry cannot
+replace these inputs. Camera IMU assistance is optional and requires the
+camera IMU port with its SDK calibration and shared capture clock.
+
+The declarations retain source identity, capture epoch and mapping evidence.
+Hardware time uses one fixed arrival-fitted offset shared by RGB, depth and
+camera IMU; its accuracy is unknown and it is explicitly unverified. It is
+not proof of synchronization with independent chassis or host clocks.
+Invalid capture times and inconsistent declarations are rejected. A failed
+pair does not partially update either clock; a source clock reset/domain
+change invalidates the epoch and requires restarting the camera source.
+Toggling a card does not authorize reuse of the old mapping. Existing skew,
+freshness and fusion limits are unchanged. Hardware stability and motion
+accuracy still require validation on Bumi.

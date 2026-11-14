@@ -79,8 +79,11 @@ def test_source_scales_measured_depth_and_keeps_distinct_capture_headers(source)
     assert stamp(messages['/robot/camera/rgbd/color'][1]) == 10_030_000_000
 
 
-def test_source_declarations_are_accepted_by_generic_perception_contract(source):
-    publisher, _, notices = source
+@pytest.mark.parametrize('has_mount', [False, True])
+def test_source_declarations_are_accepted_by_generic_perception_contract(source, has_mount):
+    publisher, messages, notices = source
+    if not has_mount:
+        publisher.body_mount.declaration = lambda: None
     pair = frames()
     publisher.publish(pair)
     declarations = notices[-1]['camera_info']
@@ -98,6 +101,22 @@ def test_source_declarations_are_accepted_by_generic_perception_contract(source)
         spec.loader.exec_module(module)
         accepted = module.validate_inputs({d['topic']: d for d in declarations},
                                           [d['topic'] for d in declarations])
+        from perception.plugins.camera_info import inherit
+        from perception.plugins.pointcloud_slam_config import infer_geometry
+        depth = next(d for d in declarations if d['format'] == 'image/depth-zlib')
+        cloud = inherit(depth, topic='/cloud', fmt='pointcloud2', stage='pointcloud')[0]
+        capture_ns = stamp(messages['/robot/camera/rgbd/color'][0])
+        pose = dict(frame_id='run1_odom', child_frame_id=accepted['frame_id'],
+                    position=[0., 0., 0.], quaternion=[0., 0., 0., 1.], covariance=None)
+        sample = module.make_sample('tracking', capture_ns, 'run1', accepted['clock_id'], pose)
+        geometry, evidence = infer_geometry(sample, cloud['vendor']['frame_id'],
+            stamp(messages['/robot/camera/depth'][0]), camera_info=cloud)
+        assert evidence['extrinsic_source'] == 'identical_frame'
+        assert geometry['child_from_cloud'] == np.eye(4).tolist()
+        assert cloud['vendor'].get('body_mount') == depth['vendor'].get('body_mount')
+        assert (cloud['vendor'].get('body_mount') is not None) == has_mount
+        assert cloud['vendor']['clock_id'] == accepted['clock_id']
+        assert sample['vendor']['motus_slam']['stamp_ns'] == capture_ns
     finally:
         sys.path[:] = old_path
     assert accepted['frame_id'] == 'robot_depth_optical'
@@ -560,3 +579,77 @@ def test_permanent_failure_after_transient_capture_updates_startup_availability(
     publisher.unavailable(ValueError('unsupported source distortion: ftheta'))
     assert notices[-1]['retryable'] is False
     assert 'ftheta' in notices[-1]['error']
+
+
+@pytest.mark.parametrize('bad', [0., -1., float('nan'), float('inf')])
+def test_invalid_source_timestamp_never_seeds_shared_clock(source, bad):
+    publisher, messages, _ = source
+    pair = frames()
+    pair.get_color_frame().get_timestamp = lambda: bad
+    with pytest.raises(ValueError, match='capture'):
+        publisher.publish(pair)
+    assert all(c.offset is None for c in publisher.clocks)
+    assert not any(messages.values())
+
+
+def test_failed_pair_does_not_partially_commit_clock_or_enable_imu(source):
+    publisher, messages, _ = source
+    pair = frames()
+    pair.get_depth_frame().get_timestamp = lambda: 1040.
+    with pytest.raises(ValueError, match='skew'):
+        publisher.publish(pair)
+    assert all(c.offset is None for c in publisher.clocks)
+    with pytest.raises(ValueError, match='unavailable'):
+        publisher.motion_stamp(1005., 'hardware_clock')
+    assert not any(messages.values())
+    publisher.publish(frames())
+    assert publisher.motion_stamp(1005., 'hardware_clock') == 10_005_000_000
+
+
+def test_rejected_second_stream_preserves_both_accepted_clocks(source):
+    publisher, _, _ = source
+    publisher.publish(frames())
+    previous = [c.previous for c in publisher.clocks]
+    pair = frames(ms=1020.)
+    pair.get_depth_frame().get_timestamp = lambda: 1045.
+    with pytest.raises(ValueError, match='skew'):
+        publisher.publish(pair)
+    assert [c.previous for c in publisher.clocks] == previous
+    publisher.publish(frames(ms=1020.))
+    assert publisher.motion_stamp(1025., 'hardware_clock') == 10_025_000_000
+
+
+def test_capture_domain_change_retires_mapping_even_after_card_toggle(source):
+    publisher, _, _ = source
+    publisher.publish(frames())
+    with pytest.raises(ValueError, match='domain changed'):
+        publisher.publish(frames(ms=1030., domain='system_time'))
+    publisher.set_enabled(set())
+    publisher.set_enabled({'camera', 'depth', 'imu'})
+    with pytest.raises(ValueError, match='restart'):
+        publisher.motion_stamp(1030., 'hardware_clock')
+
+
+def test_clock_reset_cannot_silently_recover_old_epoch_or_feed_imu(source):
+    publisher, messages, _ = source
+    publisher.publish(frames())
+    with pytest.raises(ValueError, match='clock reset'):
+        publisher.publish(frames(ms=900.))
+    with pytest.raises(ValueError, match='restart'):
+        publisher.motion_stamp(1005., 'hardware_clock')
+    with pytest.raises(ValueError, match='restart'):
+        publisher.publish(frames(ms=1030.))
+    assert all(len(rows) == 1 for rows in messages.values())
+
+
+def test_camera_reference_and_unknown_clock_accuracy_are_explicit(source):
+    publisher, _, notices = source
+    publisher.publish(frames())
+    for d in notices[-1]['camera_info']:
+        v = d['vendor']
+        assert v['pose_reference'] == 'camera_optical'
+        assert v['source_id'] == publisher.root
+        assert v['source_epoch'] == publisher.clock_id
+        assert v['clock_mapping_uncertainty_ns'] is None
+        assert v['clock_mapping_verified'] is False
+        assert 'clock_reference' not in v  # Arrival-fit offset is not host clock proof.

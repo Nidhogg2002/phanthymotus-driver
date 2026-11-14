@@ -9,6 +9,7 @@ from copy import deepcopy
 import math
 import os
 import time
+import threading
 import uuid
 import zlib
 
@@ -39,17 +40,19 @@ def make_geometry(intr):
     return dict(K=k.ravel().tolist(), map_x=x, map_y=y)
 
 
-def camera_declarations(root, geometry, frame_id, clock_id, source_clock, offset_ns):
+def camera_declarations(root, geometry, frame_id, clock_id, source_clock, offset_ns, *, source_epoch=None):
     common = dict(schema='motus.camera/1', id=root + '/rectified', width=640, height=480,
                   K=geometry['K'], D=[0.] * 5, distortion_model='pinhole',
                   source='derived-from-K', vendor=dict(
-                      frame_id=frame_id, clock_id=clock_id,
+                      frame_id=frame_id, clock_id=clock_id, source_id=root, pose_reference='camera_optical',
                       registration='registered_rectified',
                       registration_source='realsense_align_color_to_depth_then_rectify',
                       timestamp_semantics='source_capture_mapped',
                       source_clock=source_clock, mapping_offset_ns=offset_ns,
                       clock_mapping='fixed_arrival_offset' if source_clock == 'hardware_clock' else 'device_wall',
-                      clock_mapping_verified=False))
+                      clock_mapping_verified=False, clock_mapping_uncertainty_ns=None))
+    if source_epoch is not None:
+        common['vendor']['source_epoch'] = source_epoch
     color = dict(deepcopy(common), topic=root + '/color', format='image/jpeg')
     depth = dict(deepcopy(common), topic=root.removesuffix('/rgbd') + '/depth', format='image/depth-zlib')
     depth['vendor'].update(depth_unit='mm', depth_source='measured')
@@ -76,6 +79,8 @@ class RgbdCameraPublisher:
                                          ('depth', f'/{namespace}/camera/depth'))}
         self.enabled = {'camera', 'depth', 'imu'}
         self.clocks = [ClockMap(), ClockMap()]
+        self._clock_lock = threading.Lock()
+        self._clock_error = None
         self.geometry = self.signature = None
         self.report = report
         self.ready = False
@@ -102,15 +107,45 @@ class RgbdCameraPublisher:
     def motion_stamp(self, source_ms, domain):
         # Reuse the image clock's established offset; motion must never fit its
         # own arrival offset, even before the first valid RGB-D publication.
-        clock = self.clocks[0]
-        if clock.offset is None:
-            raise ValueError('RGB-D capture clock mapping unavailable')
-        if domain != clock.domain:
-            raise ValueError('motion and RGB-D capture clock domains differ')
-        stamp = int(source_ms * 1e6) + clock.offset
-        if not -50_000_000 <= time.time_ns() - stamp <= 500_000_000:
-            raise ValueError('stale or future motion capture time')
-        return stamp
+        with self._clock_lock:
+            if self._clock_error:
+                raise ValueError(self._clock_error)
+            clock = self.clocks[0]
+            if clock.offset is None:
+                raise ValueError('RGB-D capture clock mapping unavailable')
+            if domain != clock.domain:
+                raise ValueError('motion and RGB-D capture clock domains differ')
+            stamp = int(source_ms * 1e6) + clock.offset
+            if not -50_000_000 <= time.time_ns() - stamp <= 500_000_000:
+                raise ValueError('stale or future motion capture time')
+            return stamp
+
+    def _capture_stamps(self, sources, domains, received):
+        with self._clock_lock:
+            if self._clock_error:
+                raise ValueError(self._clock_error)
+            raw = [f.get_timestamp() for f in sources]
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or
+                   not math.isfinite(v) or v <= 0 for v in raw):
+                raise ValueError('invalid RGB-D source capture timestamp')
+            if any(c.domain is not None and (domain != c.domain or int(ms*1e6) <= c.previous)
+                   for c, domain, ms in zip(self.clocks, domains, raw)):
+                self._clock_error = 'camera clock reset or domain changed; restart camera source'
+                raise ValueError(self._clock_error)
+            if domains[0] != domains[1]:
+                raise ValueError('RGB/depth capture clock domains differ')
+            # Commit both clocks only after the whole pair passes; an SDK IMU
+            # callback cannot see a half-initialized or rejected image mapping.
+            clocks = deepcopy(self.clocks)
+            stamps = []
+            for i, ms in enumerate(raw):
+                if i == 1 and clocks[1].offset is None:
+                    clocks[1].offset = clocks[0].offset
+                stamps.append(clocks[i].convert(ms, domains[i], received))
+            if abs(stamps[0]-stamps[1]) > 20_000_000:
+                raise ValueError('RGB/depth capture skew exceeds 20 ms')
+            self.clocks = clocks
+            return stamps
 
     def close(self):
         self.body_mount.close()
@@ -149,16 +184,8 @@ class RgbdCameraPublisher:
         if rgb.shape != (480, 640, 3) or z16.shape != (480, 640) or z16.dtype.kind != 'u' or z16.dtype.itemsize != 2:
             raise ValueError('RGB-D source pixel geometry does not match calibration')
         domains = [str(f.get_frame_timestamp_domain()).rsplit('.', 1)[-1] for f in sources]
-        if domains[0] != domains[1]:
-            raise ValueError('RGB/depth capture clock domains differ')
         received = time.time_ns()
-        stamps = []
-        for index, frame in enumerate(sources):
-            if index == 1 and self.clocks[1].offset is None:
-                self.clocks[1].offset = self.clocks[0].offset
-            stamps.append(self.clocks[index].convert(float(frame.get_timestamp()), domains[index], received))
-        if abs(stamps[0] - stamps[1]) > 20_000_000:
-            raise ValueError('RGB/depth capture skew exceeds 20 ms')
+        stamps = self._capture_stamps(sources, domains, received)
         g = self.geometry
         rectified = cv2.remap(rgb, g['map_x'], g['map_y'], cv2.INTER_LINEAR)
         measured = cv2.remap(z16, g['map_x'], g['map_y'], cv2.INTER_NEAREST)
@@ -195,7 +222,7 @@ class RgbdCameraPublisher:
             self.ready = True
             declarations = camera_declarations(
                 self.root, g, self.frame_id, self.clock_id + '/' + domains[0],
-                domains[0], self.clocks[0].offset)
+                domains[0], self.clocks[0].offset, source_epoch=self.clock_id)
             for declaration in declarations:
                 declaration['vendor']['body_mount'] = deepcopy(mount)
             self.report(dict(ready=True, error=None, camera_info=declarations,
