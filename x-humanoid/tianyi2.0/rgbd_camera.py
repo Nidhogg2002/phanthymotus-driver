@@ -639,12 +639,16 @@ class RgbdCameraPlugin:
                     publish_depth = self._publishes('depth', _stamp(depth), epochs)
                     if not (publish_color or publish_depth):
                         continue
+                    mount_stamps = set()
                     if publish_color:
-                        self.body_mount.publish(_stamp(color))
+                        mount_stamps.add(_stamp(color))
+                    if publish_depth:
+                        mount_stamps.add(_stamp(depth))
+                    for stamp in sorted(mount_stamps):
+                        self.body_mount.publish(stamp)
+                    if publish_color:
                         self.color_pub.publish(out_color)
                     if publish_depth:
-                        if not publish_color or _stamp(depth) != _stamp(color):
-                            self.body_mount.publish(_stamp(depth))
                         self.depth_pub.publish(out_depth)
                     self.count += 1
                     self.last_publish_ns = time.time_ns()

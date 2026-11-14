@@ -222,10 +222,10 @@ def test_restarting_after_source_error_releases_previous_mount_listener(source):
 
 
 @pytest.mark.parametrize('streams', [('color',), ('depth',), ('color', 'depth')])
-@pytest.mark.parametrize('offset', [0, 1_000_000])
+@pytest.mark.parametrize('offset', [-1_000_000, 0, 1_000_000])
 def test_mount_matches_each_published_capture(source, streams, offset):
     source.managed = True
-    source.sub_node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=STAMP-1))
+    source.sub_node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=STAMP-2_000_000))
     for stream in streams:
         source.acquire(stream)
     last = source.color_pub if streams == ('color',) else source.depth_pub
@@ -235,13 +235,13 @@ def test_mount_matches_each_published_capture(source, streams, offset):
         source.stop_event.set()
     last.publish = finish
     emit(source, color_stamp=STAMP+offset)
-    expected = []
+    images = []
     if 'color' in streams:
-        expected.extend([(source.root+'/body_mount', STAMP+offset), (source.color_topic, STAMP+offset)])
+        images.append((source.color_topic, STAMP+offset))
     if 'depth' in streams:
-        if 'color' not in streams or offset:
-            expected.append((source.root+'/body_mount', STAMP))
-        expected.append((source.depth_topic, STAMP))
+        images.append((source.depth_topic, STAMP))
+    expected = [(source.root+'/body_mount', stamp) for stamp in sorted({s for _, s in images})]
+    expected += images
     actual = [(topic, json.loads(msg.data)['stamp_ns'] if topic.endswith('/body_mount')
                else m._stamp(msg)) for topic, msg in source.events]
     assert actual == expected
