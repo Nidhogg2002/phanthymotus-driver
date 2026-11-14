@@ -21,9 +21,10 @@ import time
 from common.camera_info import build as build_camera_info
 from common.vendor_runtime import action_schema, tool
 from deep_robotics.s10_pro.depth_projection import (
-    depth_intrinsics, project_depth, validate_transform,
+    depth_intrinsics, project_depth, validate_cloud_layout, validate_transform,
 )
 from deep_robotics.s10_pro.undistortion import CameraUndistortion, half_fov
+from deep_robotics.s10_pro.cloud_relay import CloudRelay
 
 NAME = "camera_front__depth"
 FRAME = "s10_pro_camera_front_optical"
@@ -31,11 +32,22 @@ FORMAT = "image/depth-zlib"
 ROS_FORMAT = "16UC1; compressedDepth zlib"
 MAX_DATA_BYTES = 64 * 1024 * 1024
 MAX_RESULT_AGE_S = 1.0
+SOURCE_TIMEOUT_S = 3.0
+CAMERA_ID = "deeprobotics/s10_pro/camera_front"
+FRONT_STREAM = "rtsp://10.21.33.103:8554/video4"
+INPUT_ERROR_CODES = (None, "CLOUD_PUBLISHER_UNAVAILABLE", "CLOUD_DATA_TIMEOUT",
+                     "CLOUD_RELAY_FAILED", "CLOUD_RELAY_STALE", "CLOUD_RELAY_DATA_TIMEOUT")
 DEFAULTS = {
     "cloud_topic": "/LIDAR/POINTS", "cloud_frame_id": "",
     "camera_optical_from_cloud": None,
     "min_depth_m": 0.1, "max_depth_m": 50.0, "rate_hz": 5.0,
 }
+
+
+class DepthError(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 
 def _settings(values):
@@ -201,8 +213,10 @@ class DepthWorker:
 
 
 class FrontDepthPlugin:
-    def __init__(self, config, namespace="", nodes=None, *, config_path=None):
+    def __init__(self, config, namespace="", nodes=None, *, config_path=None,
+                 extrinsics_path=None):
         self.nodes = nodes
+        self._relay_config = config
         prefix = f"/{str(namespace).strip('/')}" if namespace else ""
         self.topic = prefix + "/camera_front/depth"
         self.controller = getattr(nodes, "camera_undistortion", None)
@@ -210,14 +224,27 @@ class FrontDepthPlugin:
             self.controller = CameraUndistortion(("camera_front",))
         self.path = Path(config_path or os.environ.get("S10_FRONT_DEPTH_CONFIG") or
                          "/opt/phanthy-motus/data/s10_pro/camera_front_depth.json")
+        self.extrinsics_path = Path(extrinsics_path or os.environ.get("S10_FRONT_CAMERA_EXTRINSICS") or
+                                   "/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json")
+        self._front_stream = config.get("camera_rtsp", {}).get("camera_front", FRONT_STREAM)
+        self._active_config = None
+        self._optical_frame = FRAME
+        self._extrinsics_source = "unknown"
         self._lock = threading.RLock()
         self._lifecycle = threading.Lock()
         self._running = False
         self._generation = 0
         self._worker = self._subscription = self._publisher = None
+        self._watchdog = None
+        self._source_state = "idle"
+        self._started_at = self._last_cloud_at = self._observed_frame = None
+        self._publisher_count = None
+        self._relay = None
+        self._input_transport = "ros"
         self._last_stamp = None
         self._last_submit = float("-inf")
         self._last_error = None
+        self._error_code = None
         self._stats = {"received": 0, "published": 0, "dropped": 0, "throttled": 0}
         try:
             self._config = _settings(config.get("camera_front_depth", {}))
@@ -229,13 +256,53 @@ class FrontDepthPlugin:
         except (ValueError, OSError, KeyError, TypeError) as exc:
             self._config = copy.deepcopy(DEFAULTS)
             self._last_error = f"cannot load front-depth configuration: {exc}"
+            self._error_code = "CONFIGURATION_INVALID"
+
+    def _load_extrinsics(self, settings):
+        """Read deployment data; a present invalid record never falls back."""
+        try:
+            record = json.loads(self.extrinsics_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            if settings["camera_optical_from_cloud"] is None:
+                raise DepthError("CALIBRATION_MISSING",
+                    f"Front-camera extrinsics are unavailable: {self.extrinsics_path}. "
+                    "A robot-specific calibration must be provisioned by deployment; "
+                    "no mounting angle or identity transform is assumed.")
+            if not settings["cloud_frame_id"]:
+                raise DepthError("CALIBRATION_INVALID", "Calibration is missing cloud_frame_id")
+            return settings, FRAME, "maintenance-config"
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise DepthError("CALIBRATION_INVALID",
+                             f"Cannot read front-camera calibration {self.extrinsics_path}: {exc}") from exc
+        try:
+            if not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != 1:
+                raise ValueError("expected a version 1 calibration object")
+            for key, expected in (("camera_id", CAMERA_ID), ("front_camera_stream", self._front_stream),
+                                  ("translation_unit", "m"), ("camera_axes", "x_right_y_down_z_forward"),
+                                  ("cloud_topic", DEFAULTS["cloud_topic"])):
+                if record.get(key) != expected:
+                    raise ValueError(f"calibration {key} does not match the active front-camera binding")
+            frame = record["camera_optical_frame_id"]
+            if not isinstance(frame, str) or not frame or len(frame) > 128 or any(c.isspace() for c in frame):
+                raise ValueError("calibration camera_optical_frame_id must name the measured optical frame")
+            resolved = _settings({**settings, **{key: record[key] for key in
+                ("cloud_topic", "cloud_frame_id", "camera_optical_from_cloud")}})
+            if not resolved["cloud_frame_id"] or resolved["cloud_frame_id"] in {"map", "world", "odom"}:
+                raise ValueError("calibration cloud_frame_id must name the fixed sensor source")
+            if resolved["camera_optical_from_cloud"] is None:
+                raise ValueError("calibration camera_optical_from_cloud is missing")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DepthError("CALIBRATION_INVALID",
+                             f"Invalid front-camera calibration {self.extrinsics_path}: {exc}") from exc
+        return resolved, frame, "file:" + str(self.extrinsics_path)
 
     def _camera_info(self):
         calibration, source = self.controller.calibration("camera_front")
         k = depth_intrinsics(calibration) if calibration else None
         horizontal, vertical = half_fov(k, 640, 480) if k else (None, None)
         with self._lock:
-            config = copy.deepcopy(self._config)
+            config = copy.deepcopy(self._active_config or self._config)
+            optical_frame, extrinsics_source = self._optical_frame, self._extrinsics_source
         return build_camera_info(
             topic=self.topic, id="deeprobotics/s10_pro/camera_front", format=FORMAT,
             width=640, height=480, distortion_model="pinhole" if k else "unknown",
@@ -246,10 +313,11 @@ class FrontDepthPlugin:
             pipeline=["deeprobotics/s10_pro/camera_front", "deeprobotics/s10_pro/undistort",
                       "lidar_projection", "resize:640x360->640x480"],
             vendor={
-                "frame_id": FRAME, "calibration_source": source,
+                "frame_id": optical_frame, "calibration_source": source,
                 "cloud_topic": config["cloud_topic"], "cloud_frame_id": config["cloud_frame_id"],
                 "camera_optical_from_cloud": config["camera_optical_from_cloud"],
-                "extrinsics_source": "manual" if config["camera_optical_from_cloud"] else "unknown",
+                "extrinsics_source": extrinsics_source,
+                "reprojection_verified": False,
                 "depth_unit": "mm", "depth_scale_m": .001, "invalid_depth_value": 0,
                 "depth_quantity": "optical_z", "sparse": True, "hole_filling": False,
                 "registered_view": "camera_front", "depth_aligned_to_rgb": False,
@@ -266,7 +334,7 @@ class FrontDepthPlugin:
         with self._lock:
             settings = copy.deepcopy(self._config)
         properties = {
-            "cloud_topic": {"type": "string", "title": "原始雷达 PointCloud2 话题"},
+            "cloud_topic": {"type": "string", "title": "源点云 PointCloud2 话题"},
             "cloud_frame_id": {"type": "string", "title": "雷达消息的 frame_id"},
             "camera_optical_from_cloud": {"type": "string", "title": "雷达到前相机光学坐标的 4×4 外参",
                 "description": "Measured rigid transform as a JSON 4x4 array; translation in metres. No default."},
@@ -275,17 +343,17 @@ class FrontDepthPlugin:
             "rate_hz": {"type": "number", "title": "最大输出频率（Hz）", "exclusiveMinimum": 0, "maximum": 15},
         }
         schema = action_schema({
-            "start": ([], "启动前相机稀疏深度；需要已配置外参和雷达坐标系"),
+            "start": ([], "自动加载本机标定并启动前相机稀疏深度；标定缺失时明确报错"),
             "stop": ([], "停止本深度流"), "info": ([], "深度参数、运行状态和时间来源"),
             "config": (list(properties), "保存深度配置；修改后重新启动本卡片"),
         }, properties)
         card = tool(NAME, "sensor", "山猫 S10 Pro 前相机视角的雷达稀疏深度（毫米）；空洞为未知，未与 RTSP 曝光同步",
                     schema, topic_out=[{"topic": self.topic, "format": FORMAT}])
         card["camera_info"] = [self._camera_info()]
-        config_properties = copy.deepcopy(properties)
+        config_properties = {key: copy.deepcopy(properties[key]) for key in
+                             ("min_depth_m", "max_depth_m", "rate_hz")}
         for key, prop in config_properties.items():
-            prop.update(scope="instance", default=(json.dumps(settings[key]) if settings[key] is not None
-                else "") if key == "camera_optical_from_cloud" else settings[key])
+            prop.update(scope="instance", default=settings[key])
         card["configSchema"] = {"type": "object", "properties": config_properties}
         return card
 
@@ -301,30 +369,44 @@ class FrontDepthPlugin:
             self._running = False
             self._generation += 1
             subscription, worker = self._subscription, self._worker
+            watchdog = self._watchdog
+            relay, self._relay = self._relay, None
+            self._input_transport = "ros"
             self._subscription = self._worker = None
+            self._watchdog = None
+            self._source_state = "idle"
+            self._last_error = self._error_code = None
         try:
-            if subscription is not None:
-                self.nodes.robot.destroy_subscription(subscription)
+            if watchdog is not None:
+                self.nodes.robot.destroy_timer(watchdog)
         finally:
-            if worker is not None:
-                worker.close()
+            try:
+                if subscription is not None:
+                    self.nodes.robot.destroy_subscription(subscription)
+            finally:
+                try:
+                    if relay is not None:
+                        relay.close()
+                finally:
+                    if worker is not None:
+                        worker.close()
 
     def _start_capture(self):
         with self._lifecycle:
             with self._lock:
+                if self._running and self._worker is not None and self._worker.is_alive():
+                    return
+            self._stop_locked()
+            with self._lock:
+                self._active_config = None
+                self._extrinsics_source = "unknown"
+                self._optical_frame = FRAME
                 settings = copy.deepcopy(self._config)
-            if settings["camera_optical_from_cloud"] is None:
-                raise ValueError("camera_optical_from_cloud is required: configure the measured 4x4 extrinsic")
-            if not settings["cloud_frame_id"]:
-                raise ValueError("cloud_frame_id is required: copy the raw PointCloud2 header.frame_id")
+            settings, optical_frame, extrinsics_source = self._load_extrinsics(settings)
             if not self.controller.active("camera_front"):
                 raise ValueError("camera_front undistort must be enabled with valid calibration")
             if self.nodes is None:
                 raise ValueError("ROS 2 runtime is unavailable")
-            with self._lock:
-                if self._running and self._worker is not None and self._worker.is_alive():
-                    return
-            self._stop_locked()
             from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
             from sensor_msgs.msg import CompressedImage, PointCloud2
             try:
@@ -335,6 +417,13 @@ class FrontDepthPlugin:
                     generation = self._generation
                     self._last_stamp, self._last_submit = None, float("-inf")
                     self._last_error = None
+                    self._error_code = None
+                    self._active_config = settings
+                    self._optical_frame = optical_frame
+                    self._extrinsics_source = extrinsics_source
+                    self._source_state = "waiting"
+                    self._started_at = time.monotonic()
+                    self._last_cloud_at = self._observed_frame = self._publisher_count = None
                     self._worker = DepthWorker(self._receive_result, self._worker_error)
                     self._worker.start()
                     self._running = True
@@ -342,17 +431,74 @@ class FrontDepthPlugin:
                     PointCloud2, settings["cloud_topic"],
                     lambda message: self._receive_cloud(generation, message), self.nodes._sensor_qos,
                     callback_group=MutuallyExclusiveCallbackGroup())
+                self._watchdog = self.nodes.robot.create_timer(
+                    1.0, lambda: self._watch_source(generation))
             except Exception:
                 self._stop_locked()
                 raise
 
-    def _drop(self, reason):
-        self._stats["dropped"] += 1
-        self._last_error = reason
-
-    def _receive_cloud(self, generation, message):
+    def _watch_source(self, generation):
         with self._lock:
             if not self._running or generation != self._generation:
+                return
+            topic = self._active_config["cloud_topic"]
+            transport = self._input_transport
+        try:
+            publishers = (len(self.nodes.robot.get_publishers_info_by_topic(topic))
+                          if transport == "ros" else None)
+        except RuntimeError:
+            publishers = None
+        with self._lock:
+            if not self._running or generation != self._generation:
+                return
+            self._publisher_count = publishers
+            age = time.monotonic() - (self._last_cloud_at if self._last_cloud_at is not None
+                                      else self._started_at)
+            if age <= SOURCE_TIMEOUT_S:
+                self._source_state = "live" if self._last_cloud_at is not None else "waiting"
+                return
+            self._source_state = "stale" if self._last_cloud_at is not None or publishers != 0 else "no_publisher"
+            if self._error_code not in INPUT_ERROR_CODES:
+                return
+            if self._input_transport == "ssh":
+                if self._error_code not in ("CLOUD_RELAY_FAILED", "CLOUD_RELAY_STALE"):
+                    self._error_code = "CLOUD_RELAY_DATA_TIMEOUT"
+                    self._last_error = f"No fresh SSH cloud received from {topic} for more than {SOURCE_TIMEOUT_S:g} seconds"
+                return
+            if publishers == 0:
+                self._error_code = "CLOUD_PUBLISHER_UNAVAILABLE"
+                self._last_error = (f"No visible publisher for {topic} in the driver ROS domain. "
+                    "Check robot-side DDS publishing scope and cross-host reachability; "
+                    "a registered topic alone does not prove its publisher is reachable.")
+            else:
+                self._error_code = "CLOUD_DATA_TIMEOUT"
+                self._last_error = f"No valid cloud received from {topic} for more than {SOURCE_TIMEOUT_S:g} seconds"
+            # No factory settings change: the remote process only subscribes.
+            relay = CloudRelay(self._relay_config, topic, self._active_config["rate_hz"],
+                lambda message: self._receive_cloud(generation, message, "ssh"),
+                lambda code, reason: self._relay_error(generation, code, reason))
+            self._relay, self._input_transport = relay, "ssh"
+            try:
+                relay.start()
+            except (OSError, RuntimeError):
+                relay.close()
+                self._relay, self._input_transport = None, "ros"
+                self._error_code, self._last_error = "CLOUD_RELAY_FAILED", "Could not start the SSH cloud reader"
+
+    def _relay_error(self, generation, code, reason):
+        with self._lock:
+            if self._running and generation == self._generation and self._input_transport == "ssh":
+                self._error_code, self._last_error = code, reason
+                self._source_state = "stale"
+
+    def _drop(self, reason, code="INVALID_CLOUD"):
+        self._stats["dropped"] += 1
+        self._last_error = reason
+        self._error_code = code
+
+    def _receive_cloud(self, generation, message, transport="ros"):
+        with self._lock:
+            if not self._running or generation != self._generation or transport != self._input_transport:
                 return
             self._stats["received"] += 1
             try:
@@ -361,37 +507,47 @@ class FrontDepthPlugin:
                 if self._worker is None or not self._worker.is_alive():
                     raise ValueError("depth worker is not running; restart the card")
                 header = message.header
-                if header.frame_id != self._config["cloud_frame_id"]:
-                    raise ValueError(f"unexpected cloud frame {header.frame_id!r}; expected {self._config['cloud_frame_id']!r}")
+                self._observed_frame = header.frame_id
+                config = self._active_config
+                if header.frame_id != config["cloud_frame_id"]:
+                    raise DepthError("CLOUD_FRAME_MISMATCH",
+                        f"unexpected cloud frame {header.frame_id!r}; expected {config['cloud_frame_id']!r}")
                 sec, nsec = header.stamp.sec, header.stamp.nanosec
                 if type(sec) is not int or type(nsec) is not int or sec < 0 or not 0 <= nsec < 1_000_000_000:
                     raise ValueError("invalid lidar source stamp")
                 stamp = sec * 1_000_000_000 + nsec
                 if stamp <= 0 or (self._last_stamp is not None and stamp <= self._last_stamp):
                     raise ValueError("missing, repeated or backward lidar stamp; restart after a source clock reset")
-                now = time.monotonic()
-                if now - self._last_submit < 1 / self._config["rate_hz"]:
-                    self._stats["throttled"] += 1
-                    return
                 view = memoryview(message.data)
                 if view.nbytes > MAX_DATA_BYTES:
                     raise ValueError("point cloud exceeds 64 MiB")
+                source = {"fields": [(f.name, f.offset, f.datatype, f.count) for f in message.fields],
+                          "is_bigendian": message.is_bigendian, "width": message.width, "height": message.height,
+                          "point_step": message.point_step, "row_step": message.row_step, "data": view}
+                validate_cloud_layout(source)
+                now = time.monotonic()
+                self._last_cloud_at = now
+                self._source_state = "live"
+                if self._error_code in INPUT_ERROR_CODES:
+                    self._last_error = self._error_code = None
+                if now - self._last_submit < 1 / config["rate_hz"]:
+                    self._stats["throttled"] += 1
+                    return
                 calibration, _ = self.controller.calibration("camera_front")
+                source["data"] = bytes(view)
                 job = {
                     "generation": generation, "camera_generation": self.controller.generation("camera_front"),
                     "stamp": (sec, nsec), "received_monotonic": now,
-                    "cloud": {"fields": [(f.name, f.offset, f.datatype, f.count) for f in message.fields],
-                              "is_bigendian": message.is_bigendian, "width": message.width, "height": message.height,
-                              "point_step": message.point_step, "row_step": message.row_step, "data": bytes(view)},
-                    "K": depth_intrinsics(calibration), "transform": self._config["camera_optical_from_cloud"],
-                    "min_depth_m": self._config["min_depth_m"], "max_depth_m": self._config["max_depth_m"],
+                    "cloud": source,
+                    "K": depth_intrinsics(calibration), "transform": config["camera_optical_from_cloud"],
+                    "min_depth_m": config["min_depth_m"], "max_depth_m": config["max_depth_m"],
                 }
                 if self._worker.submit(job):
                     self._last_stamp, self._last_submit = stamp, now
                 else:
                     self._drop("depth queue is busy; newest frame dropped")
             except (ValueError, TypeError, AttributeError) as exc:
-                self._drop(str(exc)[:300])
+                self._drop(str(exc)[:300], getattr(exc, "code", "INVALID_CLOUD"))
 
     def _worker_error(self, context, reason):
         with self._lock:
@@ -413,7 +569,7 @@ class FrontDepthPlugin:
             def publish():
                 from sensor_msgs.msg import CompressedImage
                 output = CompressedImage()
-                output.header.frame_id = FRAME
+                output.header.frame_id = self._optical_frame
                 output.header.stamp.sec, output.header.stamp.nanosec = context["stamp"]
                 output.format, output.data = ROS_FORMAT, packet
                 self._publisher.publish(output)
@@ -421,6 +577,7 @@ class FrontDepthPlugin:
                 self._stats["published"] += 1
                 self._stats["last_source_stamp"] = list(context["stamp"])
                 self._last_error = None
+                self._error_code = None
             # Hold both guards through enqueue so a stop/config/undistort
             # change cannot let an older generation slip into the DDS queue.
             self.controller.publish_if_current("camera_front", context["camera_generation"], publish,
@@ -446,7 +603,9 @@ class FrontDepthPlugin:
             self._stop_locked()
             with self._lock:
                 self._config = candidate
+                self._active_config = None
                 self._last_error = None
+                self._error_code = None
 
     def _info(self):
         with self._lock:
@@ -456,11 +615,21 @@ class FrontDepthPlugin:
                 error = "depth worker is not running; restart the card"
             if self._running and not self.controller.active("camera_front"):
                 error = "camera_front undistort is disabled"
-            if self._running and error:
+            if error:
                 state = "error"
-            result = {"state": state, "config": copy.deepcopy(self._config),
+            result = {"state": state, "config": copy.deepcopy(self._active_config or self._config),
                       "stats": copy.deepcopy(self._stats), "last_error": error,
+                      "error_code": self._error_code,
                       "topic_out": [{"topic": self.topic, "format": FORMAT}]}
+            result["input"] = {"state": self._source_state,
+                "transport": self._input_transport,
+                "relay": self._relay.status() if self._relay is not None else None,
+                "cloud_topic": result["config"]["cloud_topic"],
+                "observed_frame_id": self._observed_frame,
+                "expected_frame_id": result["config"]["cloud_frame_id"],
+                "publisher_count": self._publisher_count, "timeout_s": SOURCE_TIMEOUT_S,
+                "last_valid_cloud_age_s": (None if self._last_cloud_at is None else
+                                           max(0., time.monotonic() - self._last_cloud_at))}
         result["camera_info"] = [self._camera_info()]
         return result
 
@@ -484,4 +653,8 @@ class FrontDepthPlugin:
                 return None
             return self._info()
         except (ValueError, TypeError, OSError, RuntimeError, ImportError) as exc:
-            return {"state": "error", "message": str(exc)}
+            code = getattr(exc, "code", "DEPTH_START_FAILED" if action == "start" else "CONFIGURATION_INVALID")
+            if action == "start":
+                with self._lock:
+                    self._last_error, self._error_code = str(exc), code
+            return {"state": "error", "code": code, "message": str(exc)}

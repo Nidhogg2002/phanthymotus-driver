@@ -89,7 +89,8 @@ def depth_intrinsics(calibration):
                         0, k[4] * sy, (k[5] + .5) * sy - .5, 0, 0, 1])
 
 
-def _cloud_layout(cloud):
+def validate_cloud_layout(cloud):
+    """Validate bounded metadata/buffer layout without reading or copying points."""
     if not isinstance(cloud, Mapping):
         raise ValueError('cloud must be an object')
     width = _integer(cloud.get('width'), 'cloud width', maximum=MAX_SOURCE_POINTS)
@@ -158,7 +159,7 @@ def project_depth(cloud, K, camera_optical_from_cloud, *, min_depth_m=0.1,
     max_points = _integer(max_points, 'max_points', 1, MAX_SOURCE_POINTS)
     k = _intrinsics(K)
     matrix = validate_transform(camera_optical_from_cloud)
-    width, total, point_step, row_step, data, fields = _cloud_layout(cloud)
+    width, total, point_step, row_step, data, fields = validate_cloud_layout(cloud)
     sampled = min(total, max_points)
     # Allocation happens only after all input/resource validation succeeds.
     zbuffer = array('d', [0.0]) * (WIDTH * HEIGHT)

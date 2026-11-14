@@ -10,7 +10,7 @@ charging and navigation.
 | Battery | `/BATTERY_DATA` (`drdds/msg/BatteryData`) | `soc`, `soh`, `current`, `voltage`, `cell_vol`, `temperature`, `cycle` as JSON |
 | Joints | `/JOINTS_DATA_10HZ` (`drdds/msg/JointsData`) and `/IMU` | `joints_info` JSON with joint names/angles/speeds/torques/temperatures; `joints` skeleton with 16 joints and IMU orientation |
 | Cameras | AOS RTSP streams on `10.21.33.103:8554` | Four JPEG streams on the existing `camera_front`, `camera_rear`, `camera_left`, and `camera_right` topics |
-| `camera_front__depth` | One explicitly configured raw `PointCloud2` source and measured LiDAR-to-camera extrinsics | Sparse front-view depth on `/{namespace}/camera_front/depth`, `image/depth-zlib`, 640x480 uint16 millimetres |
+| `camera_front__depth` | `/LIDAR/POINTS` and automatically loaded robot-specific optical extrinsics | Sparse front-view depth on `/{namespace}/camera_front/depth`, `image/depth-zlib`, 640x480 uint16 millimetres |
 | LiDAR | 22 historical/live PointCloud2 candidates; `/ACCUMULATED_POINTS_MAP` remains the map source | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers; only one fresh cloud source is active at a time |
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 | `loco_servo` | `control/velocity` (`motus.control/1`, twist) | bounded continuous velocity commands to the native S10 TCP controller; dry-run by default |
@@ -176,14 +176,82 @@ bundle startup only advertises the card.
 
 ### First-use configuration
 
-Keep the `camera_front` card's `undistort` setting enabled. In the depth card's
-configuration form, set the following values, then start the depth card:
+Keep the `camera_front` card's `undistort` setting enabled.
+Start the card normally; calibration and transport fields
+are not exposed in canvas settings. Deployment provisions the robot-specific
+calibration once, independently of canvas projects.
+
+At each fresh start, the driver reads
+`/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json` (override with
+`S10_FRONT_CAMERA_EXTRINSICS`). This is a new deployment interface, not an
+existing factory file discovered on the robot. The driver only reads it.
+The version-1 JSON object requires:
+
+| Field | Required meaning |
+| --- | --- |
+| `version` | Integer `1` |
+| `camera_id` | `deeprobotics/s10_pro/camera_front` |
+| `front_camera_stream` | Exact configured front RTSP URL; normally `rtsp://10.21.33.103:8554/video4` |
+| `cloud_topic` | `/LIDAR/POINTS`; no automatic map/display fallback |
+| `cloud_frame_id` | Calibrated source frame, checked against each message's `header.frame_id` |
+| `camera_optical_frame_id` | Target optical frame named by the calibration; this does not assert a manufacturer TF exists |
+| `translation_unit` | `m` |
+| `camera_axes` | `x_right_y_down_z_forward` |
+| `camera_optical_from_cloud` | Measured directed numeric 4x4 rigid transform |
+
+No example matrix is supplied: an identity or visual estimate is not a
+calibration. Missing records return `CALIBRATION_MISSING`; malformed records,
+wrong camera/stream/topic/units/axes, or invalid matrices return
+`CALIBRATION_INVALID`. Start failures remain visible in `info`. A present invalid
+record cannot silently fall back to a previous or maintenance configuration.
+Stop/start reloads the file; repeated start of a healthy session is idempotent.
+
+For the robot inspected on 2026-11-14, the operator has confirmed the missing
+body/cloud and camera-axis relationships. Its derived mounting record is
+[`resource/calibration/s10_pro_cd1_inspected_20261114.json`](resource/calibration/s10_pro_cd1_inspected_20261114.json).
+It is scoped to that robot and preserves its manual/confirmation provenance.
+Future deployment must provision this already-generated record at the data
+path above; it is not a model-wide image fallback. It has not been deployed or
+verified by image/cloud reprojection.
+
+### Automatic point-cloud transport
+
+Each start first uses the existing robot-domain ROS subscription. After three
+seconds without valid clouds, the card automatically starts a read-only SSH
+reader on NOS and delivers its samples directly to this card. It does not
+republish `/LIDAR/POINTS` into either ROS domain. A healthy local ROS source
+never starts SSH; after fallback the session keeps SSH as its sole input until
+stop/start, avoiding duplicate input from a recovering DDS connection.
+
+The reader reuses `controlled_spatial.ssh_host` / `ssh_user` and existing
+`S10_DRMAP_SSH_HOST`, `S10_DRMAP_SSH_USER`, `S10_DRMAP_PASSWORD` deployment
+settings. It verifies the pinned host key (`S10_SSH_KNOWN_HOSTS`) and uses
+existing key authentication if no password is configured. No canvas settings
+or new credentials are required. It runs the module from memory using the
+already-installed NOS `/opt/ros/jazzy` runtime, in the configured robot domain.
+Localhost-only discovery applies only to this temporary process; factory
+services and DDS configuration are not changed. ROS file logging, rosout,
+parameter-event publication and parameter/type-description services are
+disabled. Stop closes the reader and its owned local SSH process group.
+
+The protocol preserves original frame, source stamp, fields, byte order and
+point bytes across ROS distributions. Each request transfers at most one
+latest sample; subscriber depth is one. Source queue age plus request/response
+time must be at most one second. Startup has a 15-second budget, subsequent
+responses three seconds; disconnected/stalled readers retry after one second.
+Delayed startup samples are discarded. `info.input.transport` reports `ros`
+or `ssh`, with relay state/count under `info.input.relay`. Failures are explicit:
+`CLOUD_RELAY_FAILED`, `CLOUD_RELAY_STALE`, or `CLOUD_RELAY_DATA_TIMEOUT`.
+Missing/invalid extrinsics still fail before any relay starts.
+
+Canvas settings contain only `min_depth_m`, `max_depth_m`, and `rate_hz`.
+The existing maintenance `config` API and saved settings remain compatible:
 
 | Setting | Meaning | Default |
 | --- | --- | --- |
 | `cloud_topic` | One raw `sensor_msgs/PointCloud2` topic whose XYZ values are in metres | `/LIDAR/POINTS` |
-| `cloud_frame_id` | The exact `header.frame_id` of that source | Empty; required before start |
-| `camera_optical_from_cloud` | Measured rigid 4x4 transform, entered as a JSON array string in the form | Empty; required before start |
+| `cloud_frame_id` | The exact calibrated `header.frame_id` of that source | Obtained from deployment calibration |
+| `camera_optical_from_cloud` | Measured rigid 4x4 transform | Obtained from deployment calibration; no guessed default |
 | `min_depth_m` / `max_depth_m` | Accepted positive optical-Z range, in metres | `0.1` / `50.0` |
 | `rate_hz` | Maximum number of clouds submitted per second | `5.0`, configurable up to `15.0` |
 
@@ -194,7 +262,10 @@ The rotation must be orthonormal with determinant +1, and the last row must be
 `[0, 0, 0, 1]`. The source frame and transform must come from calibration of the
 selected stream on this robot. The driver does not infer them from the display
 cloud, map cloud, vendor mounting positions, or an assumed identity transform.
-The default topic is a configurable candidate, not a verified frame or extrinsic.
+On the inspected CD1, `/LIDAR/POINTS` is already transformed and merged from
+both RoboSense Airy lidars in `lidar_link`. Do not apply the individual lidar
+mounting transforms a second time. The topic default alone does not establish
+the source-to-camera transform.
 
 The card's `config` action accepts the same fields either directly or inside a
 `config` object; API callers can supply the transform as a nested numeric array
@@ -202,8 +273,13 @@ or a JSON string. Valid settings are saved atomically to
 `/opt/phanthy-motus/data/s10_pro/camera_front_depth.json` (override with
 `S10_FRONT_DEPTH_CONFIG`). Saving a configuration stops this depth card and
 returns `restart_required: true`; start it again to use the new settings.
-Invalid configuration leaves the previous configuration and running session intact.
-`info` reports settings, counters, the last error, and `camera_info`.
+Invalid maintenance configuration leaves the previous configuration and running
+session intact. A complete maintenance calibration is accepted only when the
+separate deployment record is absent; a present valid deployment record owns
+the source topic, frame and transform. Automatic values are not written into
+maintenance settings. `info` reports the effective settings, counters, last
+error/code and `camera_info`. Metadata records `extrinsics_source` and
+`reprojection_verified: false`: loading a valid matrix is not a reprojection test.
 
 ### Output and interpretation
 
@@ -224,7 +300,8 @@ The depth declaration supplies its own K using pixel-centre scaling:
 values, the configured extrinsics, and `depth_aligned_to_rgb: false`.
 
 The depth header copies the selected LiDAR message's stamp exactly and uses
-`frame_id="s10_pro_camera_front_optical"`. This preserves source time without
+the calibration's `camera_optical_frame_id` (the historical driver label
+`s10_pro_camera_front_optical` for maintenance-only configurations). This preserves source time without
 asserting that the source clock is a verified acquisition clock. The existing
 RTSP JPEG timestamps are publication times; no exposure pairing is available.
 Metadata therefore declares `timestamp_source="lidar_header_unverified"`,
@@ -243,6 +320,21 @@ Stopping or reconfiguring the card discards in-flight results and releases its
 own subscription and worker. Changing front-camera undistortion invalidates
 pending depth, and disabling it blocks further depth publication. The depth
 card does not clear errors from the RGB capture pipeline.
+
+An owned one-second watchdog reports input health in `info.input`: `waiting`,
+`live`, `stale`, `no_publisher`, or `idle`, plus the observed frame, publisher
+count and age of the last valid cloud. After three seconds without valid input,
+`CLOUD_PUBLISHER_UNAVAILABLE` means the driver sees no publisher;
+`CLOUD_DATA_TIMEOUT` means input is silent or publisher discovery is unavailable.
+The watchdog is released on stop or reconfiguration. A valid returning cloud
+recovers input health. A frame mismatch is `CLOUD_FRAME_MISMATCH` and cannot
+replace the calibration's source frame.
+
+On the inspected robot, the factory raw writers advertise only SHM/loopback
+locators. Jetson therefore cannot discover them through the physical subnet,
+even in domain 0 with compatible sensor QoS. Changing Jetson subscriber QoS or
+silently choosing `/ALIGNED_POINTS` cannot fix that publishing boundary.
+See [the read-only diagnosis](docs/front-depth-diagnosis-20261114.md).
 
 ## Image and deployment
 
