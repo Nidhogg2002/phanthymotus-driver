@@ -121,18 +121,32 @@ divided by its distinct-source-time interval, with unmeasured axes null; it is d
 the REST velocity retained under `vendor`.
 
 The diagnostic event's uptime timestamp is mapped to host realtime using five
-bounded `/api/platform/v1/timestamp` request intervals. The offset is fixed
-within a segment and checked every 0.5 seconds. High-latency or inconclusive
+bounded `/api/platform/v1/timestamp` request intervals. The offset is checked
+every 0.5 seconds and follows accepted observations with a continuous ramp in
+source time, limited to 1% rate correction and at least 250 ms per ramp. This
+keeps normal clock drift from expiring a fixed segment offset. Each ramp begins
+no earlier than the latest mapped source timestamp, so published timestamps and
+pending equal-timestamp groups are not rewritten. Integrated pose is unchanged. High-latency or inconclusive
 probes do not refresh the mapping and are retried on the next diagnostic drain;
 two seconds without an accepted clock probe invalidates it. An interval proving
 the mapping is outside its budget invalidates the segment immediately.
 HTTP clock requests run in a dedicated read-only helper process so camera-bundle
 thread scheduling cannot inflate the measured request interval. The helper
 returns its original request start/end and monotonic observation time; the
-parent retains calibration, the frozen offset and all existing checks. IPC
+parent retains calibration, the bounded offset history and all existing checks. IPC
 receipt is never treated as a fresh observation. A timed-out, broken or
 misordered helper channel retires the current segment and is closed/reaped.
 The diagnostic TCP subscription and increment integration are unchanged.
+Mapping evidence uses `chassis_clock_request_interval_slew`, version `2`, with
+the actual integer `offset_ns` for each capture. The arithmetic remains
+`source_ms * 1e6 + offset_ns == stamp_ns`; the declared bound stays 50 ms, and
+accepted probe intervals must remain inside the existing 25 ms verification
+envelope. Invalid probes do not alter the ramp or refresh its two-second TTL.
+Perception's explicit input-contract path currently treats any mapping-dictionary
+change as requiring a new segment; it needs a separate compatibility update
+before this producer can be used on that path. The implicit frame-based path
+accepts changing per-capture offsets. This driver change does not modify or
+certify Perception, and has not been deployed over an active mapping session.
 `info().slam_odometry.timing` separates request/header/body time, total probe
 time, increment-read time and publication time. `last_loss` preserves the
 pre-failure timings across recovery. This instrumentation is not an accuracy

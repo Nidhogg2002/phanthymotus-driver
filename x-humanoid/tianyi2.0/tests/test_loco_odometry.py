@@ -52,13 +52,14 @@ def test_clock_requires_multiple_bounded_observations():
     assert mapping['uncertainty_ns'] == 50_000_000
 
 
-def test_clock_does_not_use_receive_time_or_change_mapping_within_segment():
+def test_clock_does_not_use_receive_time_and_preserves_already_mapped_captures():
     m = module(); clock = ready_clock(m)
     a, mapping = clock.map(1050, EPOCH + 1_060_000_000, 1_060_000_000)
     b, again = clock.map(1050, EPOCH + 1_150_000_000, 1_150_000_000)
     assert a == b and mapping == again
     clock.observe(1150, EPOCH + 1_150_500_000, EPOCH + 1_152_000_000, 1_150_500_000)
-    assert clock.map(1160, EPOCH + 1_170_000_000, 1_170_000_000)[1] == mapping
+    assert clock.map(1050, EPOCH + 1_170_000_000, 1_170_000_000) == (a, mapping)
+    assert clock.map(1160, EPOCH + 1_170_000_000, 1_170_000_000)[1]['offset_ns'] > mapping['offset_ns']
 
 
 @pytest.mark.parametrize('change', ['wide_rtt', 'wall_jump', 'device_reset', 'expired', 'future', 'old'])
@@ -515,3 +516,78 @@ def test_failed_ipc_does_not_reuse_previous_http_timing():
     client._clock_probe=types.SimpleNamespace(read=broken)
     with pytest.raises(ValueError,match='timeout'):client.observe(ready_clock(m))
     assert client.last_clock_probe == {}
+
+@pytest.mark.parametrize('direction', [-1, 1])
+def test_continuous_clock_tracks_one_hour_of_drift(direction):
+    m = module(); clock = ready_clock(m)
+    # One hour at 1500 ppm: far beyond a frozen offset's 25 ms verification window.
+    for i in range(1, 7201):
+        host_ns = 1_040_000_000 + i*500_000_000
+        drift = direction*i*750_000
+        device_ms = (host_ns-drift)//1_000_000
+        clock.observe(device_ms, EPOCH+host_ns, EPOCH+host_ns+2_000_000, host_ns)
+        stamp, evidence = clock.map(device_ms, EPOCH+host_ns+2_000_000, host_ns+2_000_000)
+        assert abs(stamp-(EPOCH+host_ns)) <= 25_000_000
+        assert evidence['uncertainty_ns'] == 50_000_000
+    assert clock._observed == host_ns
+
+
+def test_clock_slew_preserves_past_and_monotonic_millisecond_captures():
+    m = module(); clock = ready_clock(m)
+    past, metadata = clock.map(1100, EPOCH+1_110_000_000, 1_110_000_000)
+    # Device clock moves ahead; correction must not step timestamps backward.
+    clock.observe(1140, EPOCH+1_120_000_000, EPOCH+1_122_000_000, 1_120_000_000)
+    assert clock.map(1100,EPOCH+1_125_000_000,1_125_000_000) == (past, metadata)
+    stamps = [clock.map(s,EPOCH+(s-20)*1_000_000,(s-20)*1_000_000)[0]
+              for s in range(1140, 1300)]
+    assert all(b>a for a,b in zip(stamps,stamps[1:]))
+    offset = stamps[-1]-1299_000_000
+    assert offset < metadata['offset_ns']  # actually follows the new clock
+
+
+def test_drifting_clock_keeps_integrated_pose_and_equal_stamp_groups_continuous():
+    m = module(); clock = ready_clock(m); odom = m.IncrementalOdometry(clock)
+    segment = odom.segment
+    odom.feed([delta(1040)], EPOCH+1_042_000_000, 1_042_000_000)
+    last_stamp = 0
+    for i in range(1, 1201):
+        host = 1_040_000_000+i*50_000_000
+        device_ms = (host-i*75_000)//1_000_000
+        if i % 10 == 0:
+            clock.observe(device_ms,EPOCH+host,EPOCH+host+2_000_000,host)
+        samples=odom.feed([delta(device_ms,x=.004),delta(device_ms,x=.006)],
+                          EPOCH+host+2_000_000,host+2_000_000)
+        assert len(samples)==1 and samples[0]['vendor']['motus_slam']['segment_id']==segment
+        stamp=samples[0]['vendor']['motus_slam']['measurement']['stamp_ns']
+        assert stamp>last_stamp
+        last_stamp=stamp
+    assert odom._pose==pytest.approx((11.99,0,0))
+    assert len(clock._curves)<=16
+
+
+def test_probe_behind_latest_mapped_capture_does_not_rewrite_it():
+    m=module(); clock=ready_clock(m)
+    first=clock.map(1200,EPOCH+1_180_000_000,1_180_000_000)
+    clock.observe(1180,EPOCH+1_190_000_000,EPOCH+1_192_000_000,1_190_000_000)
+    assert clock.map(1200,EPOCH+1_195_000_000,1_195_000_000)==first
+    assert clock.map(1201,EPOCH+1_196_000_000,1_196_000_000)[0]>first[0]
+
+
+def test_unfinished_slew_can_reverse_without_rewriting_or_extending_expiry():
+    m=module(); clock=ready_clock(m)
+    clock.observe(1140,EPOCH+1_120_000_000,EPOCH+1_122_000_000,1_120_000_000)
+    old=clock.map(1500,EPOCH+1_480_000_000,1_480_000_000)
+    pivot=clock.map(1640,EPOCH+1_655_000_000,1_655_000_000)
+    clock.observe(1640,EPOCH+1_655_000_000,EPOCH+1_657_000_000,1_655_000_000)
+    assert clock.map(1640,EPOCH+1_657_000_000,1_657_000_000)==pivot
+    assert clock.map(1500,EPOCH+1_660_000_000,1_660_000_000)==old
+    curves, observed=list(clock._curves),clock._observed
+    with pytest.raises(m.ClockObservationRejected):
+        clock.observe(1700,EPOCH+1_715_000_000,EPOCH+1_724_000_000,1_715_000_000)
+    assert list(clock._curves)==curves and clock._observed==observed
+    stamps=[clock.map(s,EPOCH+(s+15)*1_000_000,(s+15)*1_000_000)[0]
+            for s in range(1640,1801)]
+    assert all(b>a for a,b in zip(stamps,stamps[1:]))
+    assert stamps[-1]-1800_000_000>pivot[1]['offset_ns']
+    with pytest.raises(ValueError,match='expired'):
+        clock.map(4000,EPOCH+4_015_000_000,4_015_000_000)

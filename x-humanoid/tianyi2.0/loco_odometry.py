@@ -6,6 +6,7 @@ Clock uncertainty bounds the software clock mapping, not sensor hardware delay.
 from __future__ import annotations
 
 import copy
+from collections import deque
 import http.client
 import json
 import math
@@ -29,7 +30,7 @@ class ClockObservationRejected(ValueError):
 
 
 class ClockMapping:
-    """Freeze one bounded offset per segment; invalidate instead of slewing poses."""
+    """Slew capture-time offsets within a segment without changing integrated poses."""
     def __init__(self):
         self.offset = None
         self._bounds = None
@@ -37,6 +38,8 @@ class ClockMapping:
         self._device = None
         self._observed = None
         self._wall_minus_mono = None
+        self._curves = deque(maxlen=16)
+        self._last_source_ns = 0
 
     def observe(self, device_ms, before_ns, after_ns, monotonic_ns):
         if (type(device_ms) is not int or device_ms <= 0 or
@@ -62,14 +65,33 @@ class ClockMapping:
             self._count += 1
             if self._count >= 5:
                 self.offset = (low + high) // 2
-        elif low > self.offset + UNCERTAINTY_NS // 2 or high < self.offset - UNCERTAINTY_NS // 2:
-            raise ValueError('clock mapping drift exceeds segment budget')
-        elif max(abs(self.offset - low), abs(self.offset - high)) > UNCERTAINTY_NS // 2:
-            # A broad interval overlapping the budget proves neither validity
-            # nor drift. Discard it without refreshing the last verified time.
-            raise ClockObservationRejected('clock observation cannot verify segment budget')
+                self._curves.append((0, self.offset, self.offset, 1))
+        else:
+            source_ns = device_ms * 1_000_000
+            # Never rewrite a source timestamp already mapped (including a
+            # pending equal-timestamp group awaiting its closing increment).
+            anchor = max(source_ns, self._last_source_ns)
+            current, start = self._offset_at(source_ns), self._offset_at(anchor)
+            for offset in (current, start):
+                if low > offset + UNCERTAINTY_NS // 2 or high < offset - UNCERTAINTY_NS // 2:
+                    raise ValueError('clock mapping drift exceeds segment budget')
+                if max(abs(offset-low), abs(offset-high)) > UNCERTAINTY_NS // 2:
+                    raise ClockObservationRejected('clock observation cannot verify segment budget')
+            target = (low+high)//2
+            # At most 1% rate correction: even negative corrections preserve
+            # strictly increasing integer-millisecond source timestamps.
+            duration = max(250_000_000, abs(target-start)*100)
+            self._curves.append((anchor, start, target, duration))
+            self.offset = target
         self._device, self._observed = device_ms, monotonic_ns
         self._wall_minus_mono = wall_minus_mono
+
+    def _offset_at(self, source_ns):
+        for anchor, start, target, duration in reversed(self._curves):
+            if source_ns >= anchor:
+                elapsed = min(source_ns-anchor, duration)
+                return start + (target-start)*elapsed//duration
+        raise ValueError('source measurement predates clock mapping history')
 
     def map(self, source_ms, now_ns, monotonic_ns):
         if self.offset is None or self._observed is None:
@@ -78,11 +100,14 @@ class ClockMapping:
             raise ValueError('clock observation expired')
         if abs(now_ns - monotonic_ns - self._wall_minus_mono) > 2_000_000:
             raise ValueError('host clock discontinuity')
-        stamp = source_ms * 1_000_000 + self.offset
+        source_ns = source_ms * 1_000_000
+        offset = self._offset_at(source_ns)
+        stamp = source_ns + offset
         if stamp > now_ns + UNCERTAINTY_NS or now_ns - stamp > MAX_AGE_NS:
             raise ValueError('source measurement is future or stale')
-        return stamp, {'method': 'chassis_clock_request_interval', 'version': '1',
-                       'offset_ns': self.offset, 'uncertainty_ns': UNCERTAINTY_NS,
+        self._last_source_ns = max(self._last_source_ns, source_ns)
+        return stamp, {'method': 'chassis_clock_request_interval_slew', 'version': '2',
+                       'offset_ns': offset, 'uncertainty_ns': UNCERTAINTY_NS,
                        'verified': True}
 
 
