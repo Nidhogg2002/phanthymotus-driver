@@ -126,6 +126,17 @@ within a segment and checked every 0.5 seconds. High-latency or inconclusive
 probes do not refresh the mapping and are retried on the next diagnostic drain;
 two seconds without an accepted clock probe invalidates it. An interval proving
 the mapping is outside its budget invalidates the segment immediately.
+HTTP clock requests run in a dedicated read-only helper process so camera-bundle
+thread scheduling cannot inflate the measured request interval. The helper
+returns its original request start/end and monotonic observation time; the
+parent retains calibration, the frozen offset and all existing checks. IPC
+receipt is never treated as a fresh observation. A timed-out, broken or
+misordered helper channel retires the current segment and is closed/reaped.
+The diagnostic TCP subscription and increment integration are unchanged.
+`info().slam_odometry.timing` separates request/header/body time, total probe
+time, increment-read time and publication time. `last_loss` preserves the
+pre-failure timings across recovery. This instrumentation is not an accuracy
+claim or permission to reuse an expired clock mapping.
 Each sample retains the original
 source milliseconds and the mapping in `vendor.motus_slam.measurement`;
 `stamp_ms` is mapped source time, never TCP receipt time. The user-selected 50 ms

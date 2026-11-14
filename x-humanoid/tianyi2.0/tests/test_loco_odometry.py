@@ -14,7 +14,11 @@ def module():
     assert path.exists(), 'source-timestamped chassis odometry is not implemented'
     spec = importlib.util.spec_from_file_location('tianyi_loco_odometry', path)
     result = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(result)
+    sys.path.insert(0, str(ROOT))
+    try:
+        spec.loader.exec_module(result)
+    finally:
+        sys.path.pop(0)
     return result
 
 
@@ -416,3 +420,98 @@ def test_normalized_pose_declares_actual_host_clock_reference(monkeypatch):
     assert q['pose_reference'] == 'body'
     assert q['pose_source'] == 'chassis_odometry'
     assert q['measurement']['mapping']['uncertainty_ns'] == 50_000_000
+
+
+def test_clock_probe_reports_transport_phases_without_refreshing_rejected_clock(monkeypatch):
+    import types
+    m = module(); now = [1_100_000_000]
+    monkeypatch.setattr(m, 'time', types.SimpleNamespace(
+        time_ns=lambda: EPOCH+now[0], monotonic_ns=lambda: now[0]))
+    class Response:
+        status = 200
+        def read(self, limit):
+            now[0] += 20_000_000
+            return b'1100'
+    class Http:
+        def request(self, *args): now[0] += 1_000_000
+        def getresponse(self):
+            now[0] += 2_000_000
+            return Response()
+    probe_module = sys.modules['clock_probe']
+    monkeypatch.setattr(probe_module, 'time', m.time)
+    client = m.DiagnosticClient('http://robot:1448')
+    client._clock_probe = types.SimpleNamespace(read=lambda: probe_module.measure(Http(), ''))
+    clock = ready_clock(m); before = clock._observed
+    source = m.OdometrySource('http://robot:1448', 20, lambda s: None)
+    with pytest.raises(m.ClockObservationRejected, match='round trip'):
+        source._observe(client, clock)
+    info = source.info()['timing']
+    assert info['clock_attempts'] == 1 and info['clock_accepted'] == 0
+    assert info['clock_rejections'] == {'clock observation has excessive round trip': 1}
+    assert info['last_clock_probe']['request_ms'] == 1
+    assert info['last_clock_probe']['headers_ms'] == 2
+    assert info['last_clock_probe']['body_ms'] == 20
+    assert info['last_clock_probe']['rtt_ms'] == 23
+    assert clock._observed == before
+    info['clock_rejections'].clear()
+    assert source.info()['timing']['clock_rejections']
+
+
+def test_blocked_publish_is_visible_without_rewriting_measurement_time(monkeypatch):
+    import types
+    m = module(); now = [0]
+    monkeypatch.setattr(m, 'time', types.SimpleNamespace(monotonic_ns=lambda: now[0]))
+    def publish(sample): now[0] += 300_000_000
+    source = m.OdometrySource('http://robot:1448', 20, publish)
+    sample = {'stamp_ms': 1234, 'vendor': {'motus_slam': {'status': 'tracking'}}}
+    source._emit(sample)
+    assert source.info()['timing']['publish_ms'] == 300
+    assert sample['stamp_ms'] == 1234
+
+
+def test_recovery_keeps_last_loss_timing_evidence():
+    m = module(); source = m.OdometrySource('http://robot:1448',20,lambda s: None)
+    source._timing['read_ms'] = 260
+    source._emit({'vendor': {'motus_slam': dict(status='lost', reason='clock observation expired', segment_id='old')}})
+    source._timing['read_ms'] = 2
+    source._emit({'vendor': {'motus_slam': dict(status='tracking', reason='', segment_id='new')}})
+    info = source.info()
+    assert info['status'] == 'tracking'
+    assert info['last_loss']['segment_id'] == 'old'
+    assert info['last_loss']['timing']['read_ms'] == 260
+    assert info['timing']['read_ms'] == 2
+
+
+def test_fast_loss_notification_preserves_preceding_blocked_tracking_publish(monkeypatch):
+    import types
+    m = module(); now = [0]
+    monkeypatch.setattr(m, 'time', types.SimpleNamespace(monotonic_ns=lambda: now[0]))
+    def publish(s):
+        if s['vendor']['motus_slam']['status'] == 'tracking': now[0] += 2_500_000_000
+    source = m.OdometrySource('http://robot:1448',20,publish)
+    source._emit({'vendor': {'motus_slam': {'status': 'tracking'}}})
+    source._emit({'vendor': {'motus_slam': {'status': 'lost', 'reason': 'clock observation expired'}}})
+    assert source.info()['last_loss']['timing']['publish_ms'] == 2500
+
+
+def test_late_ipc_reply_does_not_refresh_clock_observation(monkeypatch):
+    import types
+    m=module(); clock=ready_clock(m)
+    client=m.DiagnosticClient('http://robot:1448')
+    client._clock_probe=types.SimpleNamespace(read=lambda:dict(
+        device_ms=1100, before_ns=EPOCH+1_100_000_000,
+        after_ns=EPOCH+1_102_000_000, monotonic_ns=1_100_000_000))
+    client.observe(clock)
+    assert clock._observed == 1_100_000_000
+    with pytest.raises(ValueError,match='expired'):
+        clock.map(3200,EPOCH+3_200_000_000,3_200_000_000)
+
+
+def test_failed_ipc_does_not_reuse_previous_http_timing():
+    import types
+    m=module();client=m.DiagnosticClient('http://robot:1448')
+    client.last_clock_probe={'rtt_ms':1}
+    def broken():raise ValueError('clock probe IPC timeout')
+    client._clock_probe=types.SimpleNamespace(read=broken)
+    with pytest.raises(ValueError,match='timeout'):client.observe(ready_clock(m))
+    assert client.last_clock_probe == {}

@@ -16,6 +16,7 @@ import uuid
 from urllib.parse import urlsplit
 
 from common.capture_clock import host_clock_reference
+from clock_probe import ClockProbe
 
 TOPIC = 'base/deadreckon_with_gyro_yaw'
 CLOCK_ID = 'host_realtime'
@@ -205,7 +206,7 @@ class DiagnosticClient:
         url = urlsplit(base_url)
         self.host, self.http_port = url.hostname, url.port or 80
         self.prefix = url.path.rstrip('/')
-        self._socket = self._reader = self._http = None
+        self._socket = self._reader = self._clock_probe = None
         self._sequence = 0
         self._subscription = None
 
@@ -213,7 +214,12 @@ class DiagnosticClient:
         self._socket = socket.create_connection((self.host, 1445), timeout=.5)
         self._socket.settimeout(.5)
         self._reader = self._socket.makefile('rb')
-        self._http = http.client.HTTPConnection(self.host, self.http_port, timeout=.5)
+        try:
+            self._clock_probe = ClockProbe(self.host, self.http_port, self.prefix)
+        except Exception:
+            self._reader.close()
+            self._socket.close()
+            raise
         return self
 
     def _rpc(self, command, args):
@@ -255,17 +261,11 @@ class DiagnosticClient:
                           'readMultipleMessages': True, 'timeoutInMs': 0})
 
     def observe(self, clock):
-        before, mono = time.time_ns(), time.monotonic_ns()
-        self._http.request('GET', self.prefix + '/api/platform/v1/timestamp')
-        response = self._http.getresponse()
-        payload = response.read(4096)
-        after = time.time_ns()
-        if response.status != 200:
-            raise ValueError('chassis clock request failed')
-        value = json.loads(payload)
-        if isinstance(value, str) and value.isdigit():
-            value = int(value)
-        clock.observe(value, before, after, mono)
+        self.last_clock_probe = {}
+        result = self._clock_probe.read()
+        self.last_clock_probe = result
+        clock.observe(result['device_ms'], result['before_ns'], result['after_ns'],
+                      result['monotonic_ns'])
 
     def __exit__(self, *unused):
         try:
@@ -274,7 +274,7 @@ class DiagnosticClient:
         except (OSError, ValueError, TypeError):
             pass  # The bounded server subscription expires after disconnection.
         finally:
-            for resource in (self._reader, self._socket, self._http):
+            for resource in (self._reader, self._socket, self._clock_probe):
                 if resource is not None:
                     resource.close()
 
@@ -288,6 +288,9 @@ class OdometrySource:
         self._lifecycle = threading.Lock()
         self._lock = threading.Lock()
         self._status = {'status': 'waiting', 'reason': 'source not started'}
+        self._timing = {'clock_attempts': 0, 'clock_accepted': 0,
+                        'clock_rejections': {}}
+        self._last_loss = None
 
     @property
     def running(self):
@@ -295,7 +298,8 @@ class OdometrySource:
 
     def info(self):
         with self._lock:
-            return copy.deepcopy(self._status)
+            return copy.deepcopy({**self._status, 'timing': self._timing,
+                                  'last_loss': self._last_loss})
 
     def start(self):
         with self._lifecycle:
@@ -313,9 +317,41 @@ class OdometrySource:
 
     def _emit(self, sample):
         if not self._stop.is_set():
+            quality = sample['vendor']['motus_slam']
+            if quality.get('status') == 'lost':
+                with self._lock:
+                    self._last_loss = copy.deepcopy({**quality, 'timing': self._timing})
+            started = time.monotonic_ns()
             self._publish(sample)
             with self._lock:
+                self._timing['publish_ms'] = (time.monotonic_ns() - started) / 1e6
                 self._status = copy.deepcopy(sample['vendor']['motus_slam'])
+
+    def _observe(self, client, clock):
+        started = time.monotonic_ns()
+        error = None
+        try:
+            client.observe(clock)
+        except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException) as exc:
+            error = str(exc)
+            raise
+        finally:
+            finished = time.monotonic_ns()
+            with self._lock:
+                self._timing['clock_attempts'] += 1
+                if error is None:
+                    self._timing['clock_accepted'] += 1
+                else:
+                    reasons = self._timing['clock_rejections']
+                    key = error if error in (
+                        'clock observation has excessive round trip',
+                        'clock observation cannot verify segment budget') else 'other'
+                    reasons[key] = reasons.get(key, 0) + 1
+                self._timing['last_clock_probe'] = {
+                    **getattr(client, 'last_clock_probe', {}),
+                    'total_ms': (finished - started) / 1e6, 'error': error}
+                self._timing['clock_age_ms'] = (
+                    (finished - clock._observed) / 1e6 if clock._observed is not None else None)
 
     def _run(self):
         while not self._stop.is_set():
@@ -330,7 +366,7 @@ class OdometrySource:
                         if time.monotonic() >= calibration_deadline:
                             raise ValueError('clock calibration timed out')
                         try:
-                            client.observe(clock)
+                            self._observe(client, clock)
                         except ClockObservationRejected:
                             pass
                         if time.monotonic() >= calibration_deadline:
@@ -343,7 +379,7 @@ class OdometrySource:
                         started = time.monotonic()
                         if started - observed >= .5:
                             try:
-                                client.observe(clock)
+                                self._observe(client, clock)
                             except ClockObservationRejected:
                                 # Retry at the next drain instead of repeatedly
                                 # colliding with a periodic sensor callback.
@@ -351,7 +387,16 @@ class OdometrySource:
                                 pass
                             else:
                                 observed = time.monotonic()
-                        samples = integrator.feed(client.read(), time.time_ns(), time.monotonic_ns())
+                        started_read = time.monotonic_ns()
+                        try:
+                            batch = client.read()
+                        finally:
+                            read_done = time.monotonic_ns()
+                            with self._lock:
+                                self._timing['read_ms'] = (read_done - started_read) / 1e6
+                                self._timing['clock_age_ms'] = (
+                                    (read_done - clock._observed) / 1e6 if clock._observed is not None else None)
+                        samples = integrator.feed(batch, time.time_ns(), time.monotonic_ns())
                         if samples:
                             # Integrate ALL deltas, publish the newest source time at card Hz.
                             received = time.monotonic()
