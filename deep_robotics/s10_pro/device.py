@@ -24,6 +24,7 @@ from loco_servo import S10LocoServoPlugin
 from spatial import S10ControlledSpatialPlugin
 from common.odom import build_interface, build_sample
 from common.camera_info import build as build_camera_info
+from deep_robotics.s10_pro.front_depth import FrontDepthPlugin
 
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
 CAMERA_MOUNTS = {
@@ -1587,5 +1588,6 @@ def build_plugins(config, namespace=None, ros2=None):
     if str(config.get("model_variant", "standard")).lower() == "pro":
         from audio import S10MicPlugin, S10SpeakerPlugin
         plugins.extend([S10ControlledSpatialPlugin(config, navigation),
-                        S10MicPlugin(config, namespace or "", nodes), S10SpeakerPlugin(config)])
+                        S10MicPlugin(config, namespace or "", nodes), S10SpeakerPlugin(config),
+                        FrontDepthPlugin(config, namespace or "", nodes)])
     return plugins

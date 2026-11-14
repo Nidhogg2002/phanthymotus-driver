@@ -10,6 +10,7 @@ charging and navigation.
 | Battery | `/BATTERY_DATA` (`drdds/msg/BatteryData`) | `soc`, `soh`, `current`, `voltage`, `cell_vol`, `temperature`, `cycle` as JSON |
 | Joints | `/JOINTS_DATA_10HZ` (`drdds/msg/JointsData`) and `/IMU` | `joints_info` JSON with joint names/angles/speeds/torques/temperatures; `joints` skeleton with 16 joints and IMU orientation |
 | Cameras | AOS RTSP streams on `10.21.33.103:8554` | Four JPEG streams on the existing `camera_front`, `camera_rear`, `camera_left`, and `camera_right` topics |
+| `camera_front__depth` | One explicitly configured raw `PointCloud2` source and measured LiDAR-to-camera extrinsics | Sparse front-view depth on `/{namespace}/camera_front/depth`, `image/depth-zlib`, 640x480 uint16 millimetres |
 | LiDAR | 22 historical/live PointCloud2 candidates; `/ACCUMULATED_POINTS_MAP` remains the map source | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers; only one fresh cloud source is active at a time |
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 | `loco_servo` | `control/velocity` (`motus.control/1`, twist) | bounded continuous velocity commands to the native S10 TCP controller; dry-run by default |
@@ -164,6 +165,84 @@ A one-frame low-latency pipeline reconnects after stream interruption. The
 previous ROS image-topic receive path has been removed because the vendor camera service
 does not publish camera images over DDS. The final image includes the `ffmpeg`
 runtime for RTSP demuxing.
+
+## Front-camera sparse depth
+
+The Pro bundle includes one additional sensor card, `camera_front__depth`.
+It projects the original LiDAR XYZ into the rectified front camera's optical
+view. It uses the existing front-camera calibration without pulling or decoding
+another RTSP stream. It publishes only after the card's `start` action; driver
+bundle startup only advertises the card.
+
+### First-use configuration
+
+Keep the `camera_front` card's `undistort` setting enabled. In the depth card's
+configuration form, set the following values, then start the depth card:
+
+| Setting | Meaning | Default |
+| --- | --- | --- |
+| `cloud_topic` | One raw `sensor_msgs/PointCloud2` topic whose XYZ values are in metres | `/LIDAR/POINTS` |
+| `cloud_frame_id` | The exact `header.frame_id` of that source | Empty; required before start |
+| `camera_optical_from_cloud` | Measured rigid 4x4 transform, entered as a JSON array string in the form | Empty; required before start |
+| `min_depth_m` / `max_depth_m` | Accepted positive optical-Z range, in metres | `0.1` / `50.0` |
+| `rate_hz` | Maximum number of clouds submitted per second | `5.0`, configurable up to `15.0` |
+
+The transform uses column vectors:
+`[X_camera, Y_camera, Z_camera, 1] = camera_optical_from_cloud * [X_cloud, Y_cloud, Z_cloud, 1]`.
+Camera optical axes are X right, Y down, Z forward; translation is in metres.
+The rotation must be orthonormal with determinant +1, and the last row must be
+`[0, 0, 0, 1]`. The source frame and transform must come from calibration of the
+selected stream on this robot. The driver does not infer them from the display
+cloud, map cloud, vendor mounting positions, or an assumed identity transform.
+The default topic is a configurable candidate, not a verified frame or extrinsic.
+
+The card's `config` action accepts the same fields either directly or inside a
+`config` object; API callers can supply the transform as a nested numeric array
+or a JSON string. Valid settings are saved atomically to
+`/opt/phanthy-motus/data/s10_pro/camera_front_depth.json` (override with
+`S10_FRONT_DEPTH_CONFIG`). Saving a configuration stops this depth card and
+returns `restart_required: true`; start it again to use the new settings.
+Invalid configuration leaves the previous configuration and running session intact.
+`info` reports settings, counters, the last error, and `camera_info`.
+
+### Output and interpretation
+
+The output is `sensor_msgs/CompressedImage` with
+`format="16UC1; compressedDepth zlib"`: zlib level-1 compression of a fixed
+640x480, row-major, little-endian uint16 millimetre buffer. Zero means unknown.
+At each observed pixel the closest positive camera Z wins. This is sparse
+depth: holes stay zero, and no learned filling, temporal accumulation or motion
+compensation is applied. It must not be treated as a dense image or as evidence
+that an unobserved area is clear.
+
+The existing depth renderer requires 640x480, while front RGB is 640x360.
+The depth declaration supplies its own K using pixel-centre scaling:
+`fx_depth = fx_rgb`, `fy_depth = fy_rgb * 4/3`, `cx_depth = cx_rgb`, and
+`cy_depth = (cy_rgb + 0.5) * 4/3 - 0.5`. The corresponding pixel mapping is
+`u_depth = u_rgb`, `v_depth = (v_rgb + 0.5) * 4/3 - 0.5`.
+`camera_info.vendor` declares this mapping, optical-Z units, sparsity, invalid
+values, the configured extrinsics, and `depth_aligned_to_rgb: false`.
+
+The depth header copies the selected LiDAR message's stamp exactly and uses
+`frame_id="s10_pro_camera_front_optical"`. This preserves source time without
+asserting that the source clock is a verified acquisition clock. The existing
+RTSP JPEG timestamps are publication times; no exposure pairing is available.
+Metadata therefore declares `timestamp_source="lidar_header_unverified"`,
+`temporal_synchronization: false`, unknown RGB/depth capture skew and unknown
+source scan deskew. This output alone is not synchronized RGB-D input for VO.
+
+Only the explicitly configured raw topic is subscribed. There is no automatic
+source switching, and the display LiDAR's coordinate changes are not reused.
+Mismatched frames, zero/invalid/repeated/backward source stamps, malformed
+clouds, and results older than one second since local receipt are rejected.
+Restart the card after a source clock reset. Projection and compression run in
+one bounded worker process, with one pending input and one pending result;
+each cloud samples at most 200,000 points uniformly. Source data is limited to
+64 MiB and two million points. Effective output rate can be below `rate_hz`.
+Stopping or reconfiguring the card discards in-flight results and releases its
+own subscription and worker. Changing front-camera undistortion invalidates
+pending depth, and disabling it blocks further depth publication. The depth
+card does not clear errors from the RGB capture pipeline.
 
 ## Image and deployment
 

@@ -404,13 +404,16 @@ class CameraUndistortion:
         with self._lock:
             return self._generations[lane]
 
-    def publish_if_current(self, lane, generation, publish):
+    def publish_if_current(self, lane, generation, publish, *, clear_error=True):
         # Configuration and publication cannot interleave: an old FFmpeg pipe
         # may still contain a complete JPEG after terminate() was requested.
         with self._lock:
             if self._generations[lane] == generation:
                 publish()
-                self._runtime[lane]["last_error"] = None
+                # Derived streams can share the geometry guard without
+                # acknowledging recovery of the camera's own RTSP pipeline.
+                if clear_error:
+                    self._runtime[lane]["last_error"] = None
 
     def record_error(self, lane, generation, text):
         with self._lock:
